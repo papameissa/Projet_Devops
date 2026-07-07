@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: task-config
+  namespace: application
+data:
+  POSTGRES_HOST: "task-db"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "app_db"

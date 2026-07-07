@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="deck">
+  <main class="manifest">
+
+    <header class="manifest__header">
+      <div class="manifest__label">
+        <span class="manifest__eyebrow">Registre opérationnel</span>
+        <h1 class="manifest__title">Manifeste de tâches</h1>
+      </div>
+      <div class="manifest__stats">
+        <div class="stat">
+          <span class="stat__value">{{ total }}</span>
+          <span class="stat__label">total</span>
+        </div>
+        <div class="stat stat--pending">
+          <span class="stat__value">{{ pending_count }}</span>
+          <span class="stat__label">en cours</span>
+        </div>
+        <div class="stat stat--done">
+          <span class="stat__value">{{ done_count }}</span>
+          <span class="stat__label">livrées</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="perforation" aria-hidden="true"></div>
+
+    <form class="intake" action="{{ url_for('web_create_task') }}" method="post">
+      <input
+        class="intake__input"
+        type="text"
+        name="title"
+        placeholder="Nouvelle entrée du manifeste…"
+        autocomplete="off"
+        required
+      >
+      <button class="intake__submit" type="submit">
+        <span>Enregistrer</span>
+      </button>
+    </form>
+
+    <div class="perforation" aria-hidden="true"></div>
+
+    {% if tasks %}
+    <ul class="manifest__list">
+      {% for task in tasks %}
+      <li class="entry {% if task.done %}entry--done{% endif %}">
+        <form action="{{ url_for('web_toggle_task', task_id=task.id) }}" method="post" class="entry__toggle-form">
+          <button type="submit" class="entry__checkbox" aria-label="Basculer le statut">
+            {% if task.done %}✓{% endif %}
+          </button>
+        </form>
+
+        <span class="entry__ref">{{ task.ref }}</span>
+
+        <span class="entry__title">{{ task.title }}</span>
+
+        <span class="entry__status">{{ "LIVRÉ" if task.done else "EN COURS" }}</span>
+
+        <form action="{{ url_for('web_delete_task', task_id=task.id) }}" method="post" class="entry__delete-form">
+          <button type="submit" class="entry__delete" aria-label="Supprimer">✕</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">
+      <p class="empty__title">Manifeste vide.</p>
+      <p class="empty__sub">Ajoute une première entrée ci-dessus pour démarrer le suivi.</p>
+    </div>
+    {% endif %}
+
+    <footer class="manifest__footer">
+      <span>task-app · Flask + SQLAlchemy · Kubernetes / EKS</span>
+    </footer>
+  </main>
+</div>
+{% endblock %}

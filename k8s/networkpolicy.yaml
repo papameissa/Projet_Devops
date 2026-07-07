@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: task-db-allow-only-task-app
+  namespace: application
+spec:
+  podSelector:
+    matchLabels:
+      app: task-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: task-app
+      ports:
+        - protocol: TCP
+          port: 5432
