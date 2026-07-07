@@ -1,0 +1,72 @@
+---
+# ==============================================================================
+# 04_ecr_taskapp.yml — Provisioning du repository Amazon ECR pour task-app
+# hosts: local (groupe d'inventaire, cf. ansible/inventory/hosts.ini) — pattern
+# harmonisé avec tous les autres playbooks actifs (01, 02, 05, 06).
+# community.aws.ecs_ecr remplacé par l'AWS CLI (évite un conflit de modules).
+# ==============================================================================
+- name: Provisionner le repository ECR pour task-app
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Créer le repository ECR via AWS CLI
+      ansible.builtin.command: >
+        aws ecr create-repository
+        --repository-name "{{ ecr_repository_name }}"
+        --region "{{ aws_region }}"
+        --image-scanning-configuration scanOnPush=true
+        --image-tag-mutability "{{ ecr_image_tag_mutability }}"
+      register: ecr_create
+      ignore_errors: true
+
+    - name: Appliquer la mutabilité même si le repo existait déjà (idempotent)
+      # CORRECTION : create-repository ne fixe --image-tag-mutability qu'à la
+      # création. Si le repo existait déjà (créé avant ce correctif, ou créé
+      # sans ce flag), il resterait MUTABLE par défaut sans cette tâche.
+      ansible.builtin.command: >
+        aws ecr put-image-tag-mutability
+        --repository-name "{{ ecr_repository_name }}"
+        --region "{{ aws_region }}"
+        --image-tag-mutability "{{ ecr_image_tag_mutability }}"
+      changed_when: true
+
+    - name: Récupérer l'URI du repository ECR
+      ansible.builtin.command: >
+        aws ecr describe-repositories
+        --repository-names "{{ ecr_repository_name }}"
+        --region "{{ aws_region }}"
+        --query 'repositories[0].repositoryUri'
+        --output text
+      register: ecr_uri
+      changed_when: false
+
+    - name: Appliquer la politique de cycle de vie (purge images non taguées > 10)
+      ansible.builtin.command: >
+        aws ecr put-lifecycle-policy
+        --repository-name "{{ ecr_repository_name }}"
+        --region "{{ aws_region }}"
+        --lifecycle-policy-text
+        '{"rules":[{"rulePriority":1,"description":"Purger les images untagged","selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+      changed_when: true
+      ignore_errors: true
+
+    - name: Afficher l'URI du repository
+      ansible.builtin.debug:
+        msg: "Repository ECR : {{ ecr_uri.stdout }}"
+
+    - name: Vérifier la mutabilité réellement appliquée sur AWS
+      ansible.builtin.command: >
+        aws ecr describe-repositories
+        --repository-names "{{ ecr_repository_name }}"
+        --region "{{ aws_region }}"
+        --query 'repositories[0].imageTagMutability'
+        --output text
+      register: mutability_check
+      changed_when: false
+
+    - name: Confirmer la mutabilité
+      ansible.builtin.debug:
+        msg: "Mutabilité du repo {{ ecr_repository_name }} : {{ mutability_check.stdout }}"

@@ -1,0 +1,152 @@
+---
+# ==============================================================================
+# 00_iam.yml — Crée un utilisateur IAM dédié CI/CD avec une policy sur-mesure,
+# à la place d'un utilisateur "AdministratorAccess" créé à la main.
+#
+# HONNÊTETÉ TECHNIQUE : eksctl a besoin de droits IAM assez larges pour créer
+# lui-même les rôles du cluster/nodegroup (CreateRole, PassRole, CloudFormation...).
+# Cette policy n'est donc pas un minimum absolu, mais elle est scoped par service
+# et par préfixe de ressource (eksctl-*, devops-*) — sans commune mesure avec
+# AdministratorAccess qui donne un accès total au compte (S3, RDS, IAM des
+# AUTRES utilisateurs, facturation, etc.)
+#
+# Ce playbook NE crée PAS de clé d'accès automatiquement : la création de clé
+# est une action sensible à faire une seule fois, à la main, pour ne jamais
+# écraser par erreur une clé déjà utilisée dans les GitHub Secrets.
+# ==============================================================================
+- name: Créer l'utilisateur IAM CI/CD à moindre privilège
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Générer le document de policy IAM (scoped par service et par préfixe)
+      ansible.builtin.copy:
+        dest: /tmp/task-app-cicd-policy.json
+        content: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "EC2NetworkingForVpcAndEks",
+                "Effect": "Allow",
+                "Action": [
+                  "ec2:Describe*",
+                  "ec2:CreateTags",
+                  "ec2:CreateVpc", "ec2:DeleteVpc", "ec2:ModifyVpcAttribute",
+                  "ec2:CreateSubnet", "ec2:DeleteSubnet", "ec2:ModifySubnetAttribute",
+                  "ec2:CreateInternetGateway", "ec2:DeleteInternetGateway",
+                  "ec2:AttachInternetGateway", "ec2:DetachInternetGateway",
+                  "ec2:CreateRouteTable", "ec2:DeleteRouteTable",
+                  "ec2:CreateRoute", "ec2:DeleteRoute",
+                  "ec2:AssociateRouteTable", "ec2:DisassociateRouteTable",
+                  "ec2:CreateSecurityGroup", "ec2:DeleteSecurityGroup",
+                  "ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress",
+                  "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress",
+                  "ec2:RunInstances", "ec2:TerminateInstances",
+                  "ec2:CreateNetworkInterface", "ec2:DeleteNetworkInterface",
+                  "ec2:CreateLoadBalancer", "ec2:DescribeLoadBalancers",
+                  "elasticloadbalancing:*"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Sid": "AutoScalingForManagedNodegroup",
+                "Effect": "Allow",
+                "Action": "autoscaling:*",
+                "Resource": "*"
+              },
+              {
+                "Sid": "EksFullAccess",
+                "Effect": "Allow",
+                "Action": "eks:*",
+                "Resource": "*"
+              },
+              {
+                "Sid": "EcrFullAccessTaskAppOnly",
+                "Effect": "Allow",
+                "Action": "ecr:*",
+                "Resource": "arn:aws:ecr:{{ aws_region }}:*:repository/{{ ecr_repository_name }}"
+              },
+              {
+                "Sid": "EcrAuthToken",
+                "Effect": "Allow",
+                "Action": "ecr:GetAuthorizationToken",
+                "Resource": "*"
+              },
+              {
+                "Sid": "CloudFormationForEksctl",
+                "Effect": "Allow",
+                "Action": "cloudformation:*",
+                "Resource": "arn:aws:cloudformation:{{ aws_region }}:*:stack/eksctl-{{ eks_cluster_name }}-*/*"
+              },
+              {
+                "Sid": "IamForEksctlRolesOnly",
+                "Effect": "Allow",
+                "Action": [
+                  "iam:CreateRole", "iam:DeleteRole", "iam:GetRole",
+                  "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:ListRolePolicies",
+                  "iam:ListAttachedRolePolicies", "iam:PutRolePolicy", "iam:DeleteRolePolicy",
+                  "iam:CreateInstanceProfile", "iam:DeleteInstanceProfile",
+                  "iam:AddRoleToInstanceProfile", "iam:RemoveRoleFromInstanceProfile",
+                  "iam:GetInstanceProfile", "iam:PassRole", "iam:TagRole",
+                  "iam:CreateServiceLinkedRole"
+                ],
+                "Resource": [
+                  "arn:aws:iam::*:role/eksctl-{{ eks_cluster_name }}-*",
+                  "arn:aws:iam::*:instance-profile/eksctl-{{ eks_cluster_name }}-*",
+                  "arn:aws:iam::*:role/aws-service-role/*"
+                ]
+              },
+              {
+                "Sid": "StsIdentity",
+                "Effect": "Allow",
+                "Action": "sts:GetCallerIdentity",
+                "Resource": "*"
+              }
+            ]
+          }
+
+    - name: "Créer la policy IAM (idempotent, ignore si déjà créée)"
+      ansible.builtin.command: >
+        aws iam create-policy
+        --policy-name "{{ iam_policy_name }}"
+        --policy-document file:///tmp/task-app-cicd-policy.json
+      register: policy_create
+      failed_when: false
+      changed_when: policy_create.rc == 0
+
+    - name: Récupérer l'ID du compte AWS (pour construire l'ARN de la policy)
+      ansible.builtin.command: aws sts get-caller-identity --query Account --output text
+      register: aws_account_id
+      changed_when: false
+
+    - name: "Créer l'utilisateur IAM CI/CD (idempotent, ignore si déjà créé)"
+      ansible.builtin.command: >
+        aws iam create-user --user-name "{{ iam_user_name }}"
+      register: user_create
+      failed_when: false
+      changed_when: user_create.rc == 0
+
+    - name: Attacher la policy à l'utilisateur
+      ansible.builtin.command: >
+        aws iam attach-user-policy
+        --user-name "{{ iam_user_name }}"
+        --policy-arn "arn:aws:iam::{{ aws_account_id.stdout }}:policy/{{ iam_policy_name }}"
+      changed_when: true
+
+    - name: Nettoyer le fichier de policy temporaire
+      ansible.builtin.file:
+        path: /tmp/task-app-cicd-policy.json
+        state: absent
+
+    - name: Afficher les prochaines étapes (création manuelle de la clé d'accès)
+      ansible.builtin.debug:
+        msg:
+          - "Utilisateur IAM '{{ iam_user_name }}' créé avec la policy '{{ iam_policy_name }}'."
+          - "Étape manuelle restante (volontairement non automatisée) :"
+          - "  aws iam create-access-key --user-name {{ iam_user_name }}"
+          - "Copie AccessKeyId/SecretAccessKey dans les GitHub Secrets"
+          - "(AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY), puis supprime l'ancienne"
+          - "clé AdministratorAccess si tu en utilisais une."

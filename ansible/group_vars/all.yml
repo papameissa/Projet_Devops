@@ -1,0 +1,48 @@
+---
+# ==============================================================================
+# group_vars/all.yml — Source unique de toutes les variables du projet task-app
+# (VPC, EKS, ECR, namespace K8s, secrets). Utilisée par tous les playbooks actifs
+# (01, 02, 04, 05, 06) : aucune valeur n'est dupliquée ou codée en dur ailleurs.
+# ==============================================================================
+
+aws_region: us-east-1
+project_name: task-app
+environment_name: production
+
+# 00_iam.yml — Utilisateur IAM dédié CI/CD (moindre privilège, pas AdministratorAccess)
+iam_user_name: "task-app-cicd"
+iam_policy_name: "task-app-cicd-policy"
+
+# 02_eks.yml crée (ou recrée) ce cluster explicitement dans devops-vpc
+eks_cluster_name: "devops-cluster"
+
+# 01_vpc.yml — Réseau (2 AZ, subnets publics uniquement, pas de NAT Gateway)
+vpc_cidr: "10.0.0.0/16"
+az1: "us-east-1a"
+az2: "us-east-1b"
+public_subnet1_cidr: "10.0.1.0/24"
+public_subnet2_cidr: "10.0.2.0/24"
+
+# 02_eks.yml — Nodegroup managé
+eks_nodegroup_name: "workers"
+eks_node_type: "t3.micro"
+eks_nodes_desired: 2
+eks_nodes_min: 1
+eks_nodes_max: 2
+
+# 04_ecr_taskapp.yml — Registre ECR pour task-app
+ecr_repository_name: "task-app"
+ecr_image_scan_on_push: true
+ecr_image_tag_mutability: "IMMUTABLE"
+
+# Build/push
+image_tag: "latest"
+
+# Déploiement K8s
+k8s_namespace: "application"
+
+# Identifiants Postgres — ne JAMAIS committer de vraies valeurs ici.
+# En CI : injectés via -e depuis les GitHub Secrets.
+# En local : surcharger via ansible-vault (voir ansible/vault/) ou -e en ligne de commande.
+postgres_user: "app_user"
+postgres_password: "CHANGE_ME_VIA_VAULT_OU_CI"
