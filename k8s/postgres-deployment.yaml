@@ -18,6 +18,8 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
         fsGroup: 999
       containers:
         - name: postgres
@@ -71,6 +73,7 @@ spec:
         name: postgres-storage
       spec:
         accessModes: ["ReadWriteOnce"]
+        storageClassName: gp2
         resources:
           requests:
             storage: 2Gi
