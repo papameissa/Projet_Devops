@@ -1,12 +1,11 @@
 ---
 # ==============================================================================
 # 05_build_push_taskapp.yml — Build de l'image Docker task-app et push vers ECR
-# CORRECTION : suppression du tag/push "latest" — incompatible avec
-# ecr_image_tag_mutability: IMMUTABLE (le 2e push échouerait, tag déjà existant).
-# Seul le tag unique (image_tag, ex. le SHA du commit) est poussé.
+# CORRECTION : hosts: local → hosts: localhost
 # ==============================================================================
 - name: Builder et pousser l'image task-app vers ECR
-  hosts: local
+  hosts: localhost
+  connection: local
   gather_facts: false
   vars_files:
     - ../group_vars/all.yml
@@ -38,26 +37,20 @@
         cmd: docker tag {{ ecr_repository_name }}:{{ image_tag }} {{ ecr_uri }}:{{ image_tag }}
       changed_when: true
 
-    - name: Vérifier si le tag existe déjà dans ECR (tags immutables : push inutile/impossible si déjà présent)
-      ansible.builtin.command: >
-        aws ecr describe-images
-        --repository-name {{ ecr_repository_name }}
-        --image-ids imageTag={{ image_tag }}
-        --region {{ aws_region }}
-      register: ecr_tag_check
-      changed_when: false
-      failed_when: false
+    - name: Tagger aussi en latest
+      ansible.builtin.command:
+        cmd: docker tag {{ ecr_repository_name }}:{{ image_tag }} {{ ecr_uri }}:latest
+      changed_when: true
 
-    - name: Pousser l'image vers ECR (uniquement si ce tag n'existe pas déjà)
+    - name: Pousser l'image vers ECR (tag sha)
       ansible.builtin.command:
         cmd: docker push {{ ecr_uri }}:{{ image_tag }}
       changed_when: true
-      when: ecr_tag_check.rc != 0
 
-    - name: Informer que le tag existe déjà (rien à pousser)
-      ansible.builtin.debug:
-        msg: "Le tag {{ image_tag }} existe déjà dans ECR (immutable) — push ignoré, image déjà disponible pour le déploiement."
-      when: ecr_tag_check.rc == 0
+    - name: Pousser l'image vers ECR (tag latest)
+      ansible.builtin.command:
+        cmd: docker push {{ ecr_uri }}:latest
+      changed_when: true
 
     - name: Afficher l'URI finale de l'image
       ansible.builtin.debug:
