@@ -30,11 +30,30 @@
         echo "{{ ns_manifest.stdout }}" | kubectl apply -f -
       changed_when: true
 
-    - name: Installer metrics-server (requis pour le HPA), idempotent
+    - name: Vérifier si metrics-server est géré comme add-on EKS
+      ansible.builtin.command: >
+        aws eks describe-addon --cluster-name {{ eks_cluster_name }}
+        --addon-name metrics-server --region {{ aws_region }}
+      register: metrics_addon_check
+      changed_when: false
+      failed_when: false
+
+    # metrics-server est géré par AWS via "aws eks create-addon" sur ce cluster
+    # (visible dans "aws eks list-addons"). Appliquer le manifeste upstream par-dessus
+    # provoque un conflit (selector immutable + doublon de port "https"), car ce
+    # Deployment n'a jamais été créé via "kubectl apply". On ne l'installe donc QUE
+    # s'il n'est pas déjà géré comme add-on.
+    - name: Installer metrics-server via manifeste (uniquement si pas déjà un add-on EKS géré)
       ansible.builtin.command: >
         kubectl apply -f
         https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
       changed_when: true
+      when: metrics_addon_check.rc != 0
+
+    - name: Confirmer que metrics-server est déjà présent (add-on EKS géré)
+      ansible.builtin.debug:
+        msg: "metrics-server est un add-on EKS géré (aws eks list-addons) : installation via manifeste ignorée pour éviter tout conflit de selector/ports."
+      when: metrics_addon_check.rc == 0
 
     - name: Récupérer l'ID du compte AWS
       ansible.builtin.command: aws sts get-caller-identity --query Account --output text
