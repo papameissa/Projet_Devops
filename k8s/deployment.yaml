@@ -42,6 +42,8 @@ spec:
               echo "PostgreSQL prêt, démarrage de task-app.";
       containers:
         - name: task-app
+          # Cette valeur sera remplacée par Ansible :
+          # REMPLACER_PAR_TON_ECR_URI:latest -> <account>.dkr.ecr.<region>.amazonaws.com/task-app:<commit>
           image: REMPLACER_PAR_TON_ECR_URI:latest
           securityContext:
             allowPrivilegeEscalation: false
@@ -54,18 +56,24 @@ spec:
                 name: task-config
             - secretRef:
                 name: task-secrets
+          # Readiness = app + DB OK
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 5000
             initialDelaySeconds: 10
+            timeoutSeconds: 2
             periodSeconds: 10
+            failureThreshold: 3
+          # Liveness = process Flask/Gunicorn vivant
           livenessProbe:
             httpGet:
               path: /health
               port: 5000
             initialDelaySeconds: 20
+            timeoutSeconds: 2
             periodSeconds: 20
+            failureThreshold: 3
           resources:
             requests:
               cpu: "50m"
