@@ -44,9 +44,8 @@
     # Deployment n'a jamais été créé via "kubectl apply". On ne l'installe donc QUE
     # s'il n'est pas déjà géré comme add-on.
     - name: Installer metrics-server via manifeste (uniquement si pas déjà un add-on EKS géré)
-      ansible.builtin.command: >
-        kubectl apply -f
-        https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      ansible.builtin.shell: |
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
       changed_when: true
       when: metrics_addon_check.rc != 0
 
