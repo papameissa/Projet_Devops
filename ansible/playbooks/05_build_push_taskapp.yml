@@ -1,13 +1,14 @@
 ---
 # ==============================================================================
-# 05_build_push_taskapp.yml — Build de l'image Docker task-app et push vers ECR
+# 05_build_push_taskapp.yml — Build & push image task-app vers ECR
+# Best practice : tag = commit, pas de latest (ECR immuable)
 # ==============================================================================
 - name: Builder et pousser l'image task-app vers ECR
   hosts: localhost
   connection: local
   gather_facts: false
   vars_files:
-    - ../group_vars/all.yml
+    - ../group_vars/all.yml     # doit contenir aws_region, ecr_repository_name, image_tag (commit)
 
   tasks:
     - name: Récupérer l'ID du compte AWS
@@ -25,32 +26,23 @@
         | docker login --username AWS --password-stdin {{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com
       changed_when: true
 
-    - name: Builder l'image Docker
+    - name: Builder l'image Docker (tag commit)
       ansible.builtin.command:
         cmd: docker build -t {{ ecr_repository_name }}:{{ image_tag }} .
         chdir: "{{ playbook_dir }}/../../app"
       changed_when: true
 
-    - name: Tagger l'image pour ECR
+    - name: Tagger l'image pour ECR (tag commit)
       ansible.builtin.command:
         cmd: docker tag {{ ecr_repository_name }}:{{ image_tag }} {{ ecr_uri }}:{{ image_tag }}
       changed_when: true
 
-    - name: Tagger aussi en latest
-      ansible.builtin.command:
-        cmd: docker tag {{ ecr_repository_name }}:{{ image_tag }} {{ ecr_uri }}:latest
-      changed_when: true
-
-    - name: Pousser l'image vers ECR (tag sha)
+    - name: Pousser l'image vers ECR (tag commit)
       ansible.builtin.command:
         cmd: docker push {{ ecr_uri }}:{{ image_tag }}
+      register: push_result
       changed_when: true
 
-    - name: Pousser l'image vers ECR (tag latest)
-      ansible.builtin.command:
-        cmd: docker push {{ ecr_uri }}:latest
-      changed_when: true
-
-    - name: Afficher l'URI finale de l'image
+    - name: Afficher l'URI finale de l'image poussée
       ansible.builtin.debug:
         msg: "Image poussée : {{ ecr_uri }}:{{ image_tag }}"
