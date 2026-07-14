@@ -21,6 +21,17 @@ spec:
         runAsUser: 999
         runAsGroup: 999
         fsGroup: 999
+      initContainers:
+        - name: fix-permissions
+          image: postgres:16-alpine
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+          command: ["sh", "-c", "chown -R 999:999 /var/lib/postgresql/data"]
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+              subPath: postgres
       containers:
         - name: postgres
           image: postgres:16-alpine
