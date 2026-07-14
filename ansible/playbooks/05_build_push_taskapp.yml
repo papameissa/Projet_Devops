@@ -1,7 +1,6 @@
 ---
 # ==============================================================================
 # 05_build_push_taskapp.yml — Build de l'image Docker task-app et push vers ECR
-# CORRECTION : hosts: local → hosts: localhost
 # ==============================================================================
 - name: Builder et pousser l'image task-app vers ECR
   hosts: localhost
