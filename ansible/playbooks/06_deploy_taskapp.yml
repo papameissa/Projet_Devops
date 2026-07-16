@@ -1,9 +1,8 @@
 ---
 # ==============================================================================
 # 06_deploy_taskapp.yml — Déploiement de task-app sur le cluster EKS existant
-# hosts: local (groupe d'inventaire) — pattern harmonisé avec 01, 02, 04, 05.
-# Namespace dédié, secret généré à la volée, metrics-server, tag d'image unique.
 # ==============================================================================
+
 - name: Déployer task-app sur EKS
   hosts: local
   gather_facts: false
@@ -32,17 +31,14 @@
 
     - name: Vérifier si metrics-server est géré comme add-on EKS
       ansible.builtin.command: >
-        aws eks describe-addon --cluster-name {{ eks_cluster_name }}
-        --addon-name metrics-server --region {{ aws_region }}
+        aws eks describe-addon
+        --cluster-name {{ eks_cluster_name }}
+        --addon-name metrics-server
+        --region {{ aws_region }}
       register: metrics_addon_check
       changed_when: false
       failed_when: false
 
-    # metrics-server est géré par AWS via "aws eks create-addon" sur ce cluster
-    # (visible dans "aws eks list-addons"). Appliquer le manifeste upstream par-dessus
-    # provoque un conflit (selector immutable + doublon de port "https"), car ce
-    # Deployment n'a jamais été créé via "kubectl apply". On ne l'installe donc QUE
-    # s'il n'est pas déjà géré comme add-on.
     - name: Installer metrics-server via manifeste (uniquement si pas déjà un add-on EKS géré)
       ansible.builtin.shell: |
         kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
@@ -51,7 +47,7 @@
 
     - name: Confirmer que metrics-server est déjà présent (add-on EKS géré)
       ansible.builtin.debug:
-        msg: "metrics-server est un add-on EKS géré (aws eks list-addons) : installation via manifeste ignorée pour éviter tout conflit de selector/ports."
+        msg: "metrics-server est un add-on EKS géré : installation via manifeste ignorée."
       when: metrics_addon_check.rc == 0
 
     - name: Récupérer l'ID du compte AWS
@@ -61,7 +57,7 @@
 
     - name: Construire l'URI complète de l'image
       ansible.builtin.set_fact:
-        ecr_uri: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com/{{ ecr_repository_name }}:{{ image_tag }}"
+        ecr_uri: "903449438459.dkr.ecr.us-east-1.amazonaws.com/task-app:latest"
 
     - name: Générer le Secret K8s à partir des variables (jamais commité en clair)
       ansible.builtin.copy:
@@ -79,11 +75,91 @@
             POSTGRES_PASSWORD: "{{ postgres_password }}"
       no_log: true
 
-    - name: Remplacer le placeholder d'image dans deployment.yaml
-      ansible.builtin.shell: >
-        sed 's|REMPLACER_PAR_TON_ECR_URI:latest|{{ ecr_uri }}|g'
-        {{ playbook_dir }}/../../k8s/deployment.yaml > /tmp/task-deployment.yaml
-      changed_when: true
+    - name: Générer le manifest application avec image ECR
+      ansible.builtin.copy:
+        dest: /tmp/task-deployment.yaml
+        mode: "0644"
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: task-app
+            namespace: {{ k8s_namespace }}
+            labels:
+              app: task-app
+          spec:
+            replicas: 2
+            progressDeadlineSeconds: 600
+            minReadySeconds: 5
+            revisionHistoryLimit: 3
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxUnavailable: 0
+                maxSurge: 1
+            selector:
+              matchLabels:
+                app: task-app
+            template:
+              metadata:
+                labels:
+                  app: task-app
+              spec:
+                containers:
+                  - name: task-app
+                    image: {{ ecr_uri }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 5000
+                    env:
+                      - name: POSTGRES_HOST
+                        value: task-db
+                      - name: POSTGRES_PORT
+                        value: "5432"
+                      - name: POSTGRES_DB
+                        valueFrom:
+                          configMapKeyRef:
+                            name: task-config
+                            key: POSTGRES_DB
+                      - name: POSTGRES_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: task-secrets
+                            key: POSTGRES_USER
+                      - name: POSTGRES_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: task-secrets
+                            key: POSTGRES_PASSWORD
+                    readinessProbe:
+                      httpGet:
+                        path: /health
+                        port: 5000
+                      initialDelaySeconds: 15
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 6
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 5000
+                      initialDelaySeconds: 45
+                      periodSeconds: 20
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                    startupProbe:
+                      httpGet:
+                        path: /health
+                        port: 5000
+                      failureThreshold: 30
+                      periodSeconds: 10
+                    resources:
+                      requests:
+                        cpu: "100m"
+                        memory: "128Mi"
+                      limits:
+                        cpu: "500m"
+                        memory: "512Mi"
 
     - name: Appliquer les manifests K8s dans le bon ordre
       ansible.builtin.command: "kubectl apply -n {{ k8s_namespace }} -f {{ item }}"
@@ -102,6 +178,19 @@
       ansible.builtin.command: >
         kubectl rollout status deployment/task-app
         -n {{ k8s_namespace }} --timeout=300s
+      register: rollout_result
+      changed_when: false
+      failed_when: rollout_result.rc != 0
+
+    - name: Diagnostiquer le déploiement si le rollout échoue
+      ansible.builtin.shell: |
+        echo "=== deployment/task-app ==="
+        kubectl describe deployment task-app -n {{ k8s_namespace }} || true
+        echo "=== pods ==="
+        kubectl get pods -n {{ k8s_namespace }} -o wide || true
+        echo "=== events ==="
+        kubectl get events -n {{ k8s_namespace }} --sort-by=.metadata.creationTimestamp | tail -50 || true
+      when: rollout_result.rc != 0
       changed_when: false
 
     - name: Nettoyer les fichiers temporaires contenant des secrets

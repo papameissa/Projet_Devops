@@ -1,48 +1,63 @@
 ---
-# ==============================================================================
-# 05_build_push_taskapp.yml — Build & push image task-app vers ECR
-# Best practice : tag = commit, pas de latest (ECR immuable)
-# ==============================================================================
 - name: Builder et pousser l'image task-app vers ECR
   hosts: localhost
   connection: local
-  gather_facts: false
+  gather_facts: true
   vars_files:
-    - ../group_vars/all.yml     # doit contenir aws_region, ecr_repository_name, image_tag (commit)
+    - ../group_vars/all.yml
+
+  vars:
+    unique_tag: "{{ image_tag }}-{{ ansible_date_time.epoch }}"
 
   tasks:
-    - name: Récupérer l'ID du compte AWS
-      ansible.builtin.command: aws sts get-caller-identity --query Account --output text
+
+    - name: Afficher le tag utilise
+      ansible.builtin.debug:
+        msg: "Tag image : {{ unique_tag }}"
+
+    - name: Recuperer l'ID du compte AWS
+      ansible.builtin.command:
+        cmd: aws sts get-caller-identity --query Account --output text
       register: aws_account_id
       changed_when: false
 
-    - name: Construire l'URI complète du repository ECR
+    - name: Construire l'URI ECR
       ansible.builtin.set_fact:
+        ecr_registry: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com"
         ecr_uri: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com/{{ ecr_repository_name }}"
 
-    - name: Authentifier Docker auprès d'ECR
-      ansible.builtin.shell: >
-        aws ecr get-login-password --region {{ aws_region }}
-        | docker login --username AWS --password-stdin {{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com
+    - name: Authentifier Docker aupres d'ECR
+      ansible.builtin.shell:
+        cmd: >
+          aws ecr get-login-password --region {{ aws_region }}
+          | docker login --username AWS --password-stdin {{ ecr_registry }}
       changed_when: true
 
-    - name: Builder l'image Docker (tag commit)
+    - name: Builder l'image Docker
       ansible.builtin.command:
-        cmd: docker build -t {{ ecr_repository_name }}:{{ image_tag }} .
+        cmd: "docker build -t {{ ecr_repository_name }}:{{ unique_tag }} ."
         chdir: "{{ playbook_dir }}/../../app"
       changed_when: true
 
-    - name: Tagger l'image pour ECR (tag commit)
+    - name: Tagger l'image pour ECR
       ansible.builtin.command:
-        cmd: docker tag {{ ecr_repository_name }}:{{ image_tag }} {{ ecr_uri }}:{{ image_tag }}
+        cmd: >
+          docker tag {{ ecr_repository_name }}:{{ unique_tag }}
+          {{ ecr_uri }}:{{ unique_tag }}
       changed_when: true
 
-    - name: Pousser l'image vers ECR (tag commit)
+    - name: Pousser l'image vers ECR
       ansible.builtin.command:
-        cmd: docker push {{ ecr_uri }}:{{ image_tag }}
-      register: push_result
+        cmd: "docker push {{ ecr_uri }}:{{ unique_tag }}"
       changed_when: true
 
-    - name: Afficher l'URI finale de l'image poussée
+    - name: Sauvegarder le tag pour le deploy
+      ansible.builtin.copy:
+        content: "{{ unique_tag }}"
+        dest: /tmp/last_image_tag.txt
+        mode: '0644'
+      changed_when: false
+
+    - name: Recapitulatif
       ansible.builtin.debug:
-        msg: "Image poussée : {{ ecr_uri }}:{{ image_tag }}"
+        msg: "Image poussee : {{ ecr_uri }}:{{ unique_tag }}"
