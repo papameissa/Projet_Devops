@@ -23,9 +23,21 @@ spec:
       labels:
         app: task-app
     spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h task-db -p 5432 -U postgres; do
+                echo "En attente de PostgreSQL (task-db)...";
+                sleep 3;
+              done
+              echo "PostgreSQL prêt, démarrage de task-app."
       containers:
         - name: task-app
-          image: 903449438459.dkr.ecr.us-east-1.amazonaws.com/task-app:latest
+          image: 903449438459.dkr.ecr.us-east-1.amazonaws.com/task-app:1e963e6074731107762c988c7b08ebaeb9222948
           imagePullPolicy: Always
           ports:
             - containerPort: 5000
@@ -51,30 +63,24 @@ spec:
                   key: POSTGRES_PASSWORD
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 5000
-            initialDelaySeconds: 15
+            initialDelaySeconds: 10
             periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 6
+            timeoutSeconds: 2
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /health
               port: 5000
-            initialDelaySeconds: 45
+            initialDelaySeconds: 20
             periodSeconds: 20
-            timeoutSeconds: 5
+            timeoutSeconds: 2
             failureThreshold: 3
-          startupProbe:
-            httpGet:
-              path: /health
-              port: 5000
-            failureThreshold: 30
-            periodSeconds: 10
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
+              cpu: "50m"
+              memory: "96Mi"
             limits:
-              cpu: "500m"
-              memory: "512Mi"
+              cpu: "250m"
+              memory: "200Mi"
