@@ -1,48 +1,44 @@
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
-  name: task-db
+  name: task-app
   namespace: application
   labels:
-    app: task-db
+    app: task-app
 spec:
-  serviceName: task-db
-  replicas: 1
+  replicas: 2
+  progressDeadlineSeconds: 600
+  minReadySeconds: 5
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
-      app: task-db
+      app: task-app
   template:
     metadata:
       labels:
-        app: task-db
+        app: task-app
     spec:
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 999
-        runAsGroup: 999
-        fsGroup: 999
-      initContainers:
-        - name: fix-permissions
-          image: postgres:16-alpine
-          securityContext:
-            runAsNonRoot: false
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-          command: ["sh", "-c", "chown -R 999:999 /var/lib/postgresql/data"]
-          volumeMounts:
-            - name: postgres-storage
-              mountPath: /var/lib/postgresql/data
-              subPath: postgres
       containers:
-        - name: postgres
-          image: postgres:16-alpine
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
+        - name: task-app
+          image: 903449438459.dkr.ecr.us-east-1.amazonaws.com/task-app:latest
+          imagePullPolicy: Always
           ports:
-            - containerPort: 5432
+            - containerPort: 5000
           env:
+            - name: POSTGRES_HOST
+              value: task-db
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: task-config
+                  key: POSTGRES_DB
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -53,39 +49,32 @@ spec:
                 secretKeyRef:
                   name: task-secrets
                   key: POSTGRES_PASSWORD
-            - name: POSTGRES_DB
-              valueFrom:
-                configMapKeyRef:
-                  name: task-config
-                  key: POSTGRES_DB
-          volumeMounts:
-            - name: postgres-storage
-              mountPath: /var/lib/postgresql/data
-              subPath: postgres
           readinessProbe:
-            exec:
-              # $POSTGRES_USER vient de l'env (secret task-secrets), plus de valeur en dur
-              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER"]
-            initialDelaySeconds: 10
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           livenessProbe:
-            exec:
-              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER"]
-            initialDelaySeconds: 30
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 45
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            failureThreshold: 30
+            periodSeconds: 10
           resources:
             requests:
-              cpu: "50m"
+              cpu: "100m"
               memory: "128Mi"
             limits:
-              cpu: "250m"
-              memory: "256Mi"
-  volumeClaimTemplates:
-    - metadata:
-        name: postgres-storage
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: gp2
-        resources:
-          requests:
-            storage: 2Gi
+              cpu: "500m"
+              memory: "512Mi"
