@@ -1,0 +1,54 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: task-ingress
+  namespace: application
+  annotations:
+    # Classe reconnue par l'AWS Load Balancer Controller (installé via
+    # ansible/playbooks/07_alb_controller.yml)
+    kubernetes.io/ingress.class: "alb"
+
+    # "ip" : l'ALB route directement vers l'IP des pods (via le CNI AWS),
+    # plutôt que vers le NodePort de chaque worker node. Nécessite que le
+    # controller ait les droits réseau adéquats (déjà couvert par IRSA).
+    alb.ingress.kubernetes.io/target-type: "ip"
+
+    # ALB public, joignable depuis Internet — comme l'était le NLB avant.
+    alb.ingress.kubernetes.io/scheme: "internet-facing"
+
+    # Durcissement sécurité : encore du HTTP en écoute (pas de certificat TLS
+    # configuré pour l'instant), donc on limite explicitement les listeners
+    # à 80 pour éviter toute ambiguïté. À faire évoluer vers 443 + ACM dès
+    # qu'un nom de domaine est disponible pour le projet (voir note plus bas).
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+
+    # Healthcheck de l'ALB pointé sur l'endpoint /health de l'appli (liveness),
+    # pas sur / qui dépend du rendu HTML complet.
+    alb.ingress.kubernetes.io/healthcheck-path: "/health"
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: task-service
+                port:
+                  number: 80
+
+# ------------------------------------------------------------------------
+# NOTE SÉCURITÉ (à traiter dans une itération suivante du projet) :
+# Pour passer en HTTPS, il faudra :
+#   1. Un nom de domaine + une validation dans AWS Certificate Manager (ACM)
+#   2. Ajouter l'annotation :
+#        alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...
+#   3. Changer listen-ports en [{"HTTP":80},{"HTTPS":443}]
+#   4. Ajouter alb.ingress.kubernetes.io/ssl-redirect: '443' pour forcer
+#      la redirection HTTP → HTTPS
+# ------------------------------------------------------------------------

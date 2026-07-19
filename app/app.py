@@ -8,7 +8,7 @@ app = Flask(__name__)
 # ── Configuration DB via variables d'environnement ──────────────
 db_user = os.environ.get("POSTGRES_USER", "app_user")
 db_password = os.environ.get("POSTGRES_PASSWORD", "app_password")
-db_host = os.environ.get("POSTGRES_HOST", "task-db")  # par défaut sur le nom du StatefulSet
+db_host = os.environ.get("POSTGRES_HOST", "db")
 db_port = os.environ.get("POSTGRES_PORT", "5432")
 db_name = os.environ.get("POSTGRES_DB", "app_db")
 
@@ -39,6 +39,7 @@ class Task(db.Model):
 
     @property
     def ref(self):
+        # ID façon numéro de conteneur, ex: TSK-0007
         return f"TSK-{self.id:04d}"
 
 
@@ -83,21 +84,23 @@ def web_delete_task(task_id):
     return redirect(url_for("index"))
 
 
-# ── Health & Readiness ────────────────────────────────────────
+# ── Healthcheck ──────────────────────────────────────────────
+# /health = liveness : le process Flask répond, SANS dépendance externe.
+# Une coupure DB ne doit pas faire redémarrer ce conteneur par kubelet.
 @app.route("/health")
 def health():
-    # Liveness simple : l'app répond, le process est vivant
     return jsonify({"status": "ok"}), 200
 
 
+# /ready = readiness : vérifie la DB. Si elle échoue, le pod est retiré
+# du Service (plus de trafic routé) mais n'est PAS redémarré.
 @app.route("/ready")
 def ready():
-    # Readiness plus complet : on vérifie la DB
     try:
         db.session.execute(db.text("SELECT 1"))
-        return jsonify({"status": "ready", "database": "connected"}), 200
+        return jsonify({"status": "ok", "database": "connected"}), 200
     except Exception as e:
-        return jsonify({"status": "not_ready", "database": str(e)}), 503
+        return jsonify({"status": "error", "database": str(e)}), 503
 
 
 # ── API JSON ─────────────────────────────────────────────────

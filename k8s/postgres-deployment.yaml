@@ -1,56 +1,54 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
-  name: task-app
+  name: task-db
   namespace: application
   labels:
-    app: task-app
+    app: task-db
 spec:
-  replicas: 2
-  progressDeadlineSeconds: 600
-  minReadySeconds: 5
-  revisionHistoryLimit: 3
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+  serviceName: task-db
+  replicas: 1
   selector:
     matchLabels:
-      app: task-app
+      app: task-db
   template:
     metadata:
       labels:
-        app: task-app
+        app: task-db
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
       initContainers:
-        - name: wait-for-postgres
+        - name: fix-volume-permissions
+          # fsGroup ne change que le GROUPE du volume, pas son PROPRIÉTAIRE
+          # (resté root après création par le driver EBS CSI). Or "initdb"
+          # de postgres fait un chmod sur ce répertoire, ce qui exige d'en
+          # être propriétaire — impossible pour l'utilisateur non-root 999.
+          # Ce init-container tourne brièvement en root pour corriger ça.
           image: postgres:16-alpine
-          command:
-            - sh
-            - -c
-            - |
-              until pg_isready -h task-db -p 5432 -U postgres; do
-                echo "En attente de PostgreSQL (task-db)...";
-                sleep 3;
-              done
-              echo "PostgreSQL prêt, démarrage de task-app."
+          command: ["sh", "-c", "chown -R 999:999 /var/lib/postgresql/data"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+              subPath: postgres
       containers:
-        - name: task-app
-          image: 903449438459.dkr.ecr.us-east-1.amazonaws.com/task-app:1e963e6074731107762c988c7b08ebaeb9222948
-          imagePullPolicy: Always
+        - name: postgres
+          image: postgres:16-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 999
+            capabilities:
+              drop: ["ALL"]
           ports:
-            - containerPort: 5000
+            - containerPort: 5432
           env:
-            - name: POSTGRES_HOST
-              value: task-db
-            - name: POSTGRES_PORT
-              value: "5432"
-            - name: POSTGRES_DB
-              valueFrom:
-                configMapKeyRef:
-                  name: task-config
-                  key: POSTGRES_DB
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -61,26 +59,39 @@ spec:
                 secretKeyRef:
                   name: task-secrets
                   key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: task-config
+                  key: POSTGRES_DB
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+              subPath: postgres
           readinessProbe:
-            httpGet:
-              path: /ready
-              port: 5000
+            exec:
+              # $POSTGRES_USER vient de l'env (secret task-secrets), plus de valeur en dur
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER"]
             initialDelaySeconds: 10
             periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 3
           livenessProbe:
-            httpGet:
-              path: /health
-              port: 5000
-            initialDelaySeconds: 20
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER"]
+            initialDelaySeconds: 30
             periodSeconds: 20
-            timeoutSeconds: 2
-            failureThreshold: 3
           resources:
             requests:
               cpu: "50m"
-              memory: "96Mi"
+              memory: "128Mi"
             limits:
               cpu: "250m"
-              memory: "200Mi"
+              memory: "256Mi"
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 2Gi

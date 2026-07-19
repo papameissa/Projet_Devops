@@ -22,6 +22,10 @@
 
   tasks:
     - name: Générer le document de policy IAM (scoped par service et par préfixe)
+      # Note sur "IamPolicyForAlbController" plus bas : le RÔLE IAM de l'AWS
+      # Load Balancer Controller suit le pattern "eksctl-{{ eks_cluster_name }}-*",
+      # déjà couvert par le Sid "IamForEksctlRolesOnly". Le Sid dédié ci-dessous
+      # ne couvre que la ressource IAM Policy (type distinct, pas de recoupement).
       ansible.builtin.copy:
         dest: /tmp/task-app-cicd-policy.json
         content: |
@@ -104,6 +108,33 @@
                 "Effect": "Allow",
                 "Action": "sts:GetCallerIdentity",
                 "Resource": "*"
+              },
+              {
+                "Sid": "TagSearchForOrphanedAlbCleanup",
+                "Effect": "Allow",
+                "Action": "tag:GetResources",
+                "Resource": "*"
+              },
+              {
+                "Sid": "OidcProviderForIrsa",
+                "Effect": "Allow",
+                "Action": [
+                  "iam:CreateOpenIDConnectProvider",
+                  "iam:DeleteOpenIDConnectProvider",
+                  "iam:GetOpenIDConnectProvider",
+                  "iam:TagOpenIDConnectProvider",
+                  "iam:ListOpenIDConnectProviders"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Sid": "IamPolicyForAlbController",
+                "Effect": "Allow",
+                "Action": [
+                  "iam:CreatePolicy", "iam:DeletePolicy", "iam:GetPolicy",
+                  "iam:ListPolicyVersions", "iam:CreatePolicyVersion", "iam:DeletePolicyVersion"
+                ],
+                "Resource": "arn:aws:iam::*:policy/AWSLoadBalancerControllerIAMPolicy"
               }
             ]
           }

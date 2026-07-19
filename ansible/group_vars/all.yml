@@ -24,8 +24,9 @@ public_subnet1_cidr: "10.0.1.0/24"
 public_subnet2_cidr: "10.0.2.0/24"
 
 # 02_eks.yml — Nodegroup managé
-eks_nodegroup_name: "workers"
-eks_node_type: "t3.micro"
+eks_nodegroup_name: "workers-v2"
+eks_legacy_nodegroup_name: "workers"
+eks_node_type: "t3.small"
 eks_nodes_desired: 2
 eks_nodes_min: 1
 eks_nodes_max: 2

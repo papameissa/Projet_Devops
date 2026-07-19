@@ -12,6 +12,21 @@
     - ../group_vars/all.yml
 
   tasks:
+    # ---------- Fix bug Ansible : les clés de dict YAML ne sont PAS templées ----------
+    # VÉCU sur ce projet, confirmé par test isolé : écrire
+    #   tags:
+    #     "kubernetes.io/cluster/{{ eks_cluster_name }}": shared
+    # applique LITTÉRALEMENT la clé "kubernetes.io/cluster/{{ eks_cluster_name }}"
+    # sur AWS (Ansible ne template que les VALEURS d'un dict YAML, jamais les
+    # clés). Ce bug a cassé la découverte automatique des subnets par l'ALB
+    # Controller pendant des heures, sur CHAQUE run de ce playbook depuis le
+    # début du projet. Fix : construire le dict de tags comme une SEULE
+    # expression Jinja (syntaxe Python), où la clé est alors une vraie
+    # expression évaluée par le moteur Jinja, pas du YAML statique.
+    - name: Précalculer la clé de tag cluster (utilisée dans un dict Jinja complet plus bas)
+      ansible.builtin.set_fact:
+        cluster_tag_key: "kubernetes.io/cluster/{{ eks_cluster_name }}"
+
     - name: Créer le VPC
       amazon.aws.ec2_vpc_net:
         name: devops-vpc
@@ -19,9 +34,7 @@
         region: "{{ aws_region }}"
         dns_support: true
         dns_hostnames: true
-        tags:
-          Name: devops-vpc
-          "kubernetes.io/cluster/{{ eks_cluster_name }}": shared
+        tags: "{{ {'Name': 'devops-vpc', cluster_tag_key: 'shared'} }}"
         state: present
       register: vpc
 
@@ -45,10 +58,7 @@
         az: "{{ az1 }}"
         region: "{{ aws_region }}"
         map_public: true
-        tags:
-          Name: devops-public-subnet-1
-          "kubernetes.io/cluster/{{ eks_cluster_name }}": shared
-          "kubernetes.io/role/elb": "1"
+        tags: "{{ {'Name': 'devops-public-subnet-1', cluster_tag_key: 'shared', 'kubernetes.io/role/elb': '1'} }}"
         state: present
       register: public_subnet1
 
@@ -59,12 +69,45 @@
         az: "{{ az2 }}"
         region: "{{ aws_region }}"
         map_public: true
-        tags:
-          Name: devops-public-subnet-2
-          "kubernetes.io/cluster/{{ eks_cluster_name }}": shared
-          "kubernetes.io/role/elb": "1"
+        tags: "{{ {'Name': 'devops-public-subnet-2', cluster_tag_key: 'shared', 'kubernetes.io/role/elb': '1'} }}"
         state: present
       register: public_subnet2
+
+    # ---------- Garde-fou : détecter un tag cluster mal templaté ----------
+    # VÉCU sur ce projet : les subnets se sont retrouvés tagués avec le texte
+    # LITTÉRAL "kubernetes.io/cluster/{{ eks_cluster_name }}" (Jinja2 jamais
+    # résolu, probablement un run très ancien avec une variable non définie
+    # à l'époque). Résultat : l'ALB Controller ne reconnaît plus les subnets
+    # pour AUCUN cluster ("2 are tagged for other clusters"), erreur détectée
+    # seulement bien plus tard, à l'étape Ingress. On vérifie ici, tout de
+    # suite après le tagging, que le tag réellement présent sur AWS est bon.
+    - name: Vérifier que les tags de cluster sont correctement résolus sur AWS
+      # Retries : cohérence éventuelle d'AWS — le tag vient d'être posé à
+      # l'instant (create_subnet + create_tags), describe-subnets peut mettre
+      # quelques secondes à le refléter systématiquement sur les 2 subnets.
+      ansible.builtin.command: >
+        aws ec2 describe-subnets --region {{ aws_region }}
+        --subnet-ids {{ public_subnet1.subnet.id }} {{ public_subnet2.subnet.id }}
+        --query "Subnets[].Tags[?Key=='kubernetes.io/cluster/{{ eks_cluster_name }}'].Value"
+        --output text
+      register: cluster_tag_check
+      until: "'shared' in cluster_tag_check.stdout"
+      retries: 6
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: Échouer si le tag cluster est absent/mal résolu sur un des subnets
+      ansible.builtin.fail:
+        msg: >
+          Le tag "kubernetes.io/cluster/{{ eks_cluster_name }}" n'est pas
+          présent sur les 2 subnets publics (résultat obtenu :
+          "{{ cluster_tag_check.stdout }}"). Vérifie qu'aucun ancien tag
+          littéral "kubernetes.io/cluster/{{ '{{' }} eks_cluster_name {{ '}}' }}"
+          ne traîne encore dessus (aws ec2 describe-subnets --subnet-ids ...
+          --query "Subnets[].Tags"), et supprime-le avec aws ec2 delete-tags
+          si besoin avant de relancer.
+      when: "'shared' not in cluster_tag_check.stdout"
 
     - name: Créer la table de routage publique
       amazon.aws.ec2_vpc_route_table:

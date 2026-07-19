@@ -3,14 +3,12 @@ kind: Service
 metadata:
   name: task-service
   namespace: application
-  annotations:
-    # "alb" n'est pas une valeur valide pour l'annotation d'un Service (elle ne
-    # s'applique qu'aux ressources Ingress via l'AWS Load Balancer Controller).
-    # Pour un Service type LoadBalancer natif AWS, la valeur correcte est "nlb".
-    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
-    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
 spec:
-  type: LoadBalancer
+  # ClusterIP : ce Service n'est plus exposé directement sur Internet.
+  # C'est désormais la ressource Ingress (k8s/ingress.yaml), pilotée par
+  # l'AWS Load Balancer Controller, qui provisionne l'ALB public et route
+  # le trafic vers ce Service en interne.
+  type: ClusterIP
   selector:
     app: task-app
   ports:

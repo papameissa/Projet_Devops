@@ -62,21 +62,102 @@
       failed_when: false
       changed_when: false
 
-    - name: Créer le cluster EKS DANS devops-vpc (subnets publics, sans NAT Gateway)
+    - name: Créer le cluster EKS DANS devops-vpc (sans nodegroup, sans NAT Gateway)
       command: >
         eksctl create cluster
         --name {{ eks_cluster_name }}
         --region {{ aws_region }}
         --vpc-public-subnets={{ subnet1_result.stdout }},{{ subnet2_result.stdout }}
-        --nodegroup-name {{ eks_nodegroup_name }}
-        --node-type {{ eks_node_type }}
-        --nodes {{ eks_nodes_desired }}
-        --nodes-min {{ eks_nodes_min }}
-        --nodes-max {{ eks_nodes_max }}
-        --node-private-networking=false
-        --managed
+        --without-nodegroup
       when: cluster_check.rc != 0
       register: eks_creation
+
+    - name: Vérifier si le nodegroup cible existe déjà
+      command: >
+        eksctl get nodegroup --cluster {{ eks_cluster_name }} --region {{ aws_region }}
+        --name {{ eks_nodegroup_name }}
+      register: nodegroup_precheck
+      failed_when: false
+      changed_when: false
+
+    - name: Générer la config du nodegroup (avec maxPodsPerNode explicite)
+      # IMPORTANT : sur t3.micro, le max-pods par défaut du kubelet (calculé au boot
+      # à partir d'une table statique ENI/instance-type) est de 4 seulement — bien
+      # trop bas dès que cert-manager + ALB controller + composants système tournent
+      # ensemble (vécu sur ce cluster : blocage "Too many pods" malgré CPU/RAM libres).
+      # ENABLE_PREFIX_DELEGATION seul ne suffit pas : le kubelet ne recalcule jamais
+      # --max-pods tout seul, ni au runtime ni même sur des nodes fraîchement créés.
+      # Le champ ClusterConfig `maxPodsPerNode` est la seule façon documentée de
+      # l'imposer explicitement pour un nodegroup managé (pas de flag CLI équivalent).
+      ansible.builtin.copy:
+        dest: /tmp/nodegroup-{{ eks_nodegroup_name }}.yaml
+        content: |
+          apiVersion: eksctl.io/v1alpha5
+          kind: ClusterConfig
+          metadata:
+            name: {{ eks_cluster_name }}
+            region: {{ aws_region }}
+
+          managedNodeGroups:
+            - name: {{ eks_nodegroup_name }}
+              instanceType: {{ eks_node_type }}
+              desiredCapacity: {{ eks_nodes_desired }}
+              minSize: {{ eks_nodes_min }}
+              maxSize: {{ eks_nodes_max }}
+              maxPodsPerNode: 40
+              privateNetworking: false
+      when: nodegroup_precheck.rc != 0
+
+    - name: Créer le nodegroup avec maxPodsPerNode explicite
+      command: >
+        eksctl create nodegroup -f /tmp/nodegroup-{{ eks_nodegroup_name }}.yaml
+      when: nodegroup_precheck.rc != 0
+
+    # ---------- Nettoyage de l'ancien nodegroup (migration blue-green) ----------
+    # IMPORTANT (vécu sur ce cluster) : ne JAMAIS supprimer l'ancien nodegroup
+    # AVANT que le nouveau soit prêt. "eksctl delete nodegroup --drain" cordonne
+    # tous les nœuds DU NODEGROUP CIBLE en une seule fois ; si c'est le seul
+    # nodegroup du cluster, les pods évincés n'ont nulle part où se reloger et
+    # le drain time-out indéfiniment (vécu : "1 pods are unevictable", 25min de
+    # blocage). En créant d'abord {{ eks_nodegroup_name }} (ci-dessus) puis en
+    # supprimant {{ eks_legacy_nodegroup_name }} seulement APRÈS, les pods ont
+    # de la place sur le nouveau nodegroup pendant le drain de l'ancien.
+    - name: Vérifier si un ancien nodegroup (legacy) existe encore
+      command: >
+        eksctl get nodegroup --cluster {{ eks_cluster_name }} --region {{ aws_region }}
+        --name {{ eks_legacy_nodegroup_name }}
+      register: legacy_nodegroup_check
+      failed_when: false
+      changed_when: false
+      when: eks_legacy_nodegroup_name is defined and eks_legacy_nodegroup_name != eks_nodegroup_name
+
+    - name: Attendre que le nouveau nodegroup soit ACTIVE avant de purger l'ancien
+      command: >
+        eksctl get nodegroup --cluster {{ eks_cluster_name }} --region {{ aws_region }}
+        --name {{ eks_nodegroup_name }} -o json
+      register: new_nodegroup_status
+      until: "'ACTIVE' in new_nodegroup_status.stdout"
+      retries: 30
+      delay: 20
+      changed_when: false
+      when: >
+        eks_legacy_nodegroup_name is defined and eks_legacy_nodegroup_name != eks_nodegroup_name
+        and legacy_nodegroup_check.rc == 0
+
+    - name: "Supprimer l'ancien nodegroup {{ eks_legacy_nodegroup_name }} (le nouveau est prêt)"
+      # --disable-eviction : le nouveau nodegroup étant déjà ACTIVE et prêt à
+      # accueillir les pods, on bypass les règles d'éviction (PDB, pods avec
+      # emptyDir) qui bloquaient le drain ("1 pods are unevictable" observé
+      # précédemment). Les pods seront simplement recréés sur workers-v2 par
+      # leurs contrôleurs (Deployment/StatefulSet) une fois les nœuds supprimés.
+      command: >
+        eksctl delete nodegroup --cluster {{ eks_cluster_name }} --region {{ aws_region }}
+        --name {{ eks_legacy_nodegroup_name }} --drain --disable-eviction
+      when: >
+        eks_legacy_nodegroup_name is defined and eks_legacy_nodegroup_name != eks_nodegroup_name
+        and legacy_nodegroup_check.rc == 0
+      changed_when: true
+      register: nodegroup_creation
 
     - name: Afficher le résultat de la création (si effectuée)
       debug:
@@ -103,28 +184,58 @@
         msg: "OK : aucun NAT Gateway sur devops-vpc — coût réseau minimal."
       when: nat_check.stdout == ""
 
-    - name: Activer l'enforcement des NetworkPolicy sur l'addon vpc-cni
-      # IMPORTANT : par défaut, EKS déclare les NetworkPolicy dans l'API sans
-      # les appliquer réellement. Sans cette tâche, k8s/networkpolicy.yaml
-      # existerait mais n'aurait aucun effet (faux sentiment de sécurité).
+    - name: Activer NetworkPolicy + prefix delegation sur l'addon vpc-cni (config unique et durable)
+      # IMPORTANT (vécu sur ce cluster) : deux pièges distincts corrigés ici en un seul appel :
+      # 1) EKS déclare les NetworkPolicy dans l'API sans les appliquer réellement par défaut ;
+      #    sans enableNetworkPolicy, k8s/networkpolicy.yaml existerait mais serait sans effet.
+      # 2) Sur t3.micro, le kubelet limite chaque nœud à ~4 pods (DaemonSets compris) — bloque
+      #    cert-manager/ALB controller ("Too many pods", CPU/RAM pourtant larges). Un simple
+      #    'kubectl set env daemonset aws-node ENABLE_PREFIX_DELEGATION=true' NE SUFFIT PAS :
+      #    ce n'est qu'un patch live, silencieusement écrasé dès qu'EKS resynchronise l'addon
+      #    vpc-cni avec sa configurationValues stockée (ex. lors d'un remplacement de nodegroup).
+      #    Il FAUT passer par --resolve-conflicts OVERWRITE avec TOUTES les clés voulues dans
+      #    UN SEUL appel (OVERWRITE remplace tout configurationValues, pas juste les clés citées),
+      #    combiné à maxPodsPerNode sur le nodegroup (voir plus haut) pour que le kubelet
+      #    autorise vraiment plus de pods.
       ansible.builtin.command: >
         aws eks update-addon
         --cluster-name {{ eks_cluster_name }}
         --addon-name vpc-cni
         --resolve-conflicts OVERWRITE
-        --configuration-values '{"enableNetworkPolicy":"true"}'
+        --configuration-values '{"enableNetworkPolicy":"true","env":{"ENABLE_PREFIX_DELEGATION":"true","WARM_PREFIX_TARGET":"1"}}'
         --region {{ aws_region }}
       changed_when: true
       register: netpol_enable
       failed_when: false
 
-    - name: Avertir si l'activation des NetworkPolicy a échoué
+    - name: Avertir si l'activation NetworkPolicy/prefix delegation a échoué
       ansible.builtin.debug:
         msg: >
-          Activation de enableNetworkPolicy sur vpc-cni non confirmée
-          (version d'addon peut-être trop ancienne). k8s/networkpolicy.yaml
-          sera alors sans effet réel — vérifier manuellement si besoin.
+          Activation de enableNetworkPolicy / ENABLE_PREFIX_DELEGATION sur vpc-cni
+          non confirmée (version d'addon peut-être trop ancienne) — vérifier
+          manuellement avec 'aws eks describe-addon --addon-name vpc-cni
+          --cluster-name {{ eks_cluster_name }} --region {{ aws_region }}
+          --query addon.configurationValues'.
       when: netpol_enable.rc != 0
+
+    - name: Redémarrer aws-node pour appliquer la nouvelle config d'addon
+      ansible.builtin.command: >
+        kubectl rollout restart daemonset aws-node -n kube-system
+      changed_when: true
+
+    - name: "Attendre que aws-node soit prêt sur tous les nodes (jusqu'à 5min, avec retries)"
+      # Timeout relevé (90s -> 300s) + retries : juste après une migration
+      # blue-green de nodegroup (ancien qui termine de se supprimer, nouveau
+      # qui rejoint), le daemonset aws-node voit son nombre de pods désirés
+      # fluctuer (vécu : "0 out of 4" -> "0 out of 2" -> "1 out of 2") le temps
+      # que le cluster se stabilise. 90s est souvent trop court dans ce contexte.
+      ansible.builtin.command: >
+        kubectl rollout status daemonset aws-node -n kube-system --timeout=60s
+      register: awsnode_rollout
+      until: awsnode_rollout.rc == 0
+      retries: 5
+      delay: 10
+      changed_when: false
 
     - name: Vérifier que le nodegroup est bien actif
       command: >
@@ -137,6 +248,17 @@
     - name: Afficher les nodegroups détectés
       debug:
         var: nodegroup_check.stdout_lines
+
+    - name: Activer le fournisseur OIDC IAM sur le cluster (requis pour IRSA / AWS Load Balancer Controller)
+      # Sans ceci, aucun pod (ex: le controller ALB) ne peut assumer un rôle IAM
+      # via un ServiceAccount Kubernetes. "eksctl create cluster --managed" seul
+      # ne l'active PAS automatiquement.
+      ansible.builtin.command: >
+        eksctl utils associate-iam-oidc-provider
+        --cluster {{ eks_cluster_name }}
+        --region {{ aws_region }}
+        --approve
+      changed_when: true
 
     - name: Mettre à jour le kubeconfig local pour ce cluster
       command: >
@@ -161,3 +283,4 @@
           Vérifie les rôles IAM (aws-auth ConfigMap) et le statut du nodegroup
           via 'eksctl get nodegroup --cluster {{ eks_cluster_name }} --region {{ aws_region }}'.
       when: "'No resources found' in kubectl_nodes.stdout or kubectl_nodes.stdout == ''"
+

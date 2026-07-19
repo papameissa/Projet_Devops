@@ -31,19 +31,29 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+          env:
+            # Sans -U explicite, pg_isready tente de résoudre l'utilisateur OS
+            # courant (UID 1000, imposé par le securityContext du pod) via
+            # getpwuid() — mais l'image postgres:16-alpine ne connaît que
+            # l'utilisateur "postgres" (UID 999) dans /etc/passwd. Résultat :
+            # "no attempt" (échec silencieux avant même la tentative de
+            # connexion TCP), alors qu'un simple "nc" fonctionne très bien.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: task-secrets
+                  key: POSTGRES_USER
           command:
             - sh
             - -c
             - |
-              until pg_isready -h task-db -p 5432 -U postgres; do
+              until pg_isready -h task-db -p 5432 -U "$POSTGRES_USER"; do
                 echo "En attente de PostgreSQL (task-db)...";
                 sleep 3;
               done
               echo "PostgreSQL prêt, démarrage de task-app.";
       containers:
         - name: task-app
-          # Cette valeur sera remplacée par Ansible :
-          # REMPLACER_PAR_TON_ECR_URI:latest -> <account>.dkr.ecr.<region>.amazonaws.com/task-app:<commit>
           image: REMPLACER_PAR_TON_ECR_URI:latest
           securityContext:
             allowPrivilegeEscalation: false
@@ -56,24 +66,18 @@ spec:
                 name: task-config
             - secretRef:
                 name: task-secrets
-          # Readiness = app + DB OK
           readinessProbe:
             httpGet:
               path: /ready
               port: 5000
             initialDelaySeconds: 10
-            timeoutSeconds: 2
             periodSeconds: 10
-            failureThreshold: 3
-          # Liveness = process Flask/Gunicorn vivant
           livenessProbe:
             httpGet:
               path: /health
               port: 5000
             initialDelaySeconds: 20
-            timeoutSeconds: 2
             periodSeconds: 20
-            failureThreshold: 3
           resources:
             requests:
               cpu: "50m"

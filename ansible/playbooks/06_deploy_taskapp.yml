@@ -1,8 +1,9 @@
 ---
 # ==============================================================================
 # 06_deploy_taskapp.yml — Déploiement de task-app sur le cluster EKS existant
+# hosts: local (groupe d'inventaire) — pattern harmonisé avec 01, 02, 04, 05.
+# Namespace dédié, secret généré à la volée, metrics-server, tag d'image unique.
 # ==============================================================================
-
 - name: Déployer task-app sur EKS
   hosts: local
   gather_facts: false
@@ -29,35 +30,109 @@
         echo "{{ ns_manifest.stdout }}" | kubectl apply -f -
       changed_when: true
 
-    - name: Vérifier si metrics-server est géré comme add-on EKS
-      ansible.builtin.command: >
-        aws eks describe-addon
-        --cluster-name {{ eks_cluster_name }}
-        --addon-name metrics-server
-        --region {{ aws_region }}
-      register: metrics_addon_check
-      changed_when: false
+    - name: Vérifier si metrics-server est déjà déployé
+      ansible.builtin.command: kubectl get deployment metrics-server -n kube-system
+      register: metrics_check
       failed_when: false
+      changed_when: false
 
-    - name: Installer metrics-server via manifeste (uniquement si pas déjà un add-on EKS géré)
-      ansible.builtin.shell: |
-        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+    - name: Supprimer l'ancien metrics-server si présent (pour éviter le conflit de selector immuable)
+      ansible.builtin.command: >
+        kubectl delete -f
+        https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        --ignore-not-found
+      when: metrics_check.rc == 0
       changed_when: true
-      when: metrics_addon_check.rc != 0
 
-    - name: Confirmer que metrics-server est déjà présent (add-on EKS géré)
-      ansible.builtin.debug:
-        msg: "metrics-server est un add-on EKS géré : installation via manifeste ignorée."
-      when: metrics_addon_check.rc == 0
+    - name: Installer metrics-server (requis pour le HPA), idempotent
+      ansible.builtin.command: >
+        kubectl apply -f
+        https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      changed_when: true
+
+    - name: Patch metrics-server pour EKS (kubelet-insecure-tls)
+      ansible.builtin.command: >
+        kubectl patch deployment metrics-server -n kube-system --type=json
+        -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+      register: patch_result
+      failed_when: patch_result.rc != 0 and 'already exists' not in patch_result.stderr
+      changed_when: patch_result.rc == 0
 
     - name: Récupérer l'ID du compte AWS
       ansible.builtin.command: aws sts get-caller-identity --query Account --output text
       register: aws_account_id
       changed_when: false
 
+    # ---------- Driver EBS CSI (requis pour provisionner la PVC de postgres) ----------
+    # SANS CECI : la StatefulSet task-db reste bloquée en Pending pour toujours
+    # ("no persistent volumes available for this claim and no storage class is set").
+    # Depuis EKS 1.23+, le provisioner in-tree gp2 n'existe plus par défaut ; il faut
+    # explicitement le driver EBS CSI (addon) + une StorageClass qui le référence.
+    - name: Créer le ServiceAccount IRSA "ebs-csi-controller-sa" (kube-system)
+      ansible.builtin.command: >
+        eksctl create iamserviceaccount
+        --cluster {{ eks_cluster_name }}
+        --region {{ aws_region }}
+        --namespace kube-system
+        --name ebs-csi-controller-sa
+        --role-name eksctl-{{ eks_cluster_name }}-ebs-csi-role
+        --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+        --approve
+        --override-existing-serviceaccounts
+      changed_when: true
+
+    - name: Installer/mettre à jour l'addon EKS aws-ebs-csi-driver
+      # replicaCount=1 : par défaut l'addon lance 2 réplicas du controller
+      # (6 conteneurs chacun, ~230Mi de requests/pod). Sur des nœuds t3.micro
+      # déjà chargés (task-app, postgres, metrics-server, ALB controller,
+      # cert-manager...), 2 réplicas font déborder la mémoire disponible
+      # ("Insufficient memory", pods du controller Pending indéfiniment).
+      # Un seul réplica suffit largement pour ce projet (pas de besoin de HA).
+      ansible.builtin.command: >
+        aws eks update-addon
+        --cluster-name {{ eks_cluster_name }}
+        --addon-name aws-ebs-csi-driver
+        --service-account-role-arn arn:aws:iam::{{ aws_account_id.stdout }}:role/eksctl-{{ eks_cluster_name }}-ebs-csi-role
+        --configuration-values '{"controller":{"replicaCount":1}}'
+        --resolve-conflicts OVERWRITE
+        --region {{ aws_region }}
+      register: ebs_addon_update
+      failed_when: false
+      changed_when: ebs_addon_update.rc == 0
+
+    - name: "Fallback : créer l'addon aws-ebs-csi-driver si l'update a échoué (première installation)"
+      ansible.builtin.command: >
+        aws eks create-addon
+        --cluster-name {{ eks_cluster_name }}
+        --addon-name aws-ebs-csi-driver
+        --service-account-role-arn arn:aws:iam::{{ aws_account_id.stdout }}:role/eksctl-{{ eks_cluster_name }}-ebs-csi-role
+        --configuration-values '{"controller":{"replicaCount":1}}'
+        --resolve-conflicts OVERWRITE
+        --region {{ aws_region }}
+      when: ebs_addon_update.rc != 0
+      changed_when: true
+
+    - name: Attendre que l'addon aws-ebs-csi-driver soit ACTIVE
+      ansible.builtin.command: >
+        aws eks describe-addon
+        --cluster-name {{ eks_cluster_name }}
+        --addon-name aws-ebs-csi-driver
+        --region {{ aws_region }}
+        --query addon.status --output text
+      register: ebs_addon_status
+      until: ebs_addon_status.stdout == "ACTIVE"
+      retries: 18
+      delay: 10
+      changed_when: false
+
+    - name: Appliquer la StorageClass gp3 par défaut
+      ansible.builtin.command: >
+        kubectl apply -f {{ playbook_dir }}/../../k8s/storageclass.yaml
+      changed_when: true
+
     - name: Construire l'URI complète de l'image
       ansible.builtin.set_fact:
-        ecr_uri: "903449438459.dkr.ecr.us-east-1.amazonaws.com/task-app:latest"
+        ecr_uri: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com/{{ ecr_repository_name }}:{{ image_tag }}"
 
     - name: Générer le Secret K8s à partir des variables (jamais commité en clair)
       ansible.builtin.copy:
@@ -75,91 +150,11 @@
             POSTGRES_PASSWORD: "{{ postgres_password }}"
       no_log: true
 
-    - name: Générer le manifest application avec image ECR
-      ansible.builtin.copy:
-        dest: /tmp/task-deployment.yaml
-        mode: "0644"
-        content: |
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: task-app
-            namespace: {{ k8s_namespace }}
-            labels:
-              app: task-app
-          spec:
-            replicas: 2
-            progressDeadlineSeconds: 600
-            minReadySeconds: 5
-            revisionHistoryLimit: 3
-            strategy:
-              type: RollingUpdate
-              rollingUpdate:
-                maxUnavailable: 0
-                maxSurge: 1
-            selector:
-              matchLabels:
-                app: task-app
-            template:
-              metadata:
-                labels:
-                  app: task-app
-              spec:
-                containers:
-                  - name: task-app
-                    image: {{ ecr_uri }}
-                    imagePullPolicy: Always
-                    ports:
-                      - containerPort: 5000
-                    env:
-                      - name: POSTGRES_HOST
-                        value: task-db
-                      - name: POSTGRES_PORT
-                        value: "5432"
-                      - name: POSTGRES_DB
-                        valueFrom:
-                          configMapKeyRef:
-                            name: task-config
-                            key: POSTGRES_DB
-                      - name: POSTGRES_USER
-                        valueFrom:
-                          secretKeyRef:
-                            name: task-secrets
-                            key: POSTGRES_USER
-                      - name: POSTGRES_PASSWORD
-                        valueFrom:
-                          secretKeyRef:
-                            name: task-secrets
-                            key: POSTGRES_PASSWORD
-                    readinessProbe:
-                      httpGet:
-                        path: /health
-                        port: 5000
-                      initialDelaySeconds: 15
-                      periodSeconds: 10
-                      timeoutSeconds: 5
-                      failureThreshold: 6
-                    livenessProbe:
-                      httpGet:
-                        path: /health
-                        port: 5000
-                      initialDelaySeconds: 45
-                      periodSeconds: 20
-                      timeoutSeconds: 5
-                      failureThreshold: 3
-                    startupProbe:
-                      httpGet:
-                        path: /health
-                        port: 5000
-                      failureThreshold: 30
-                      periodSeconds: 10
-                    resources:
-                      requests:
-                        cpu: "100m"
-                        memory: "128Mi"
-                      limits:
-                        cpu: "500m"
-                        memory: "512Mi"
+    - name: Remplacer le placeholder d'image dans deployment.yaml
+      ansible.builtin.shell: >
+        sed 's|REMPLACER_PAR_TON_ECR_URI:latest|{{ ecr_uri }}|g'
+        {{ playbook_dir }}/../../k8s/deployment.yaml > /tmp/task-deployment.yaml
+      changed_when: true
 
     - name: Appliquer les manifests K8s dans le bon ordre
       ansible.builtin.command: "kubectl apply -n {{ k8s_namespace }} -f {{ item }}"
@@ -172,26 +167,60 @@
         - "{{ playbook_dir }}/../../k8s/service.yaml"
         - "{{ playbook_dir }}/../../k8s/hpa.yaml"
         - "{{ playbook_dir }}/../../k8s/networkpolicy.yaml"
+        - "{{ playbook_dir }}/../../k8s/ingress.yaml"
       changed_when: true
 
-    - name: Attendre que le déploiement soit prêt (timeout 300s)
-      ansible.builtin.command: >
-        kubectl rollout status deployment/task-app
-        -n {{ k8s_namespace }} --timeout=300s
-      register: rollout_result
-      changed_when: false
-      failed_when: rollout_result.rc != 0
+    - name: Attendre que le déploiement soit prêt (timeout 180s), avec diagnostic auto en cas d'échec
+      block:
+        - name: Attendre que le déploiement soit prêt (timeout 180s)
+          ansible.builtin.command: >
+            kubectl rollout status deployment/task-app
+            -n {{ k8s_namespace }} --timeout=180s
+          changed_when: false
+      rescue:
+        - name: "[DIAG] État des pods du namespace"
+          ansible.builtin.command: "kubectl get pods -n {{ k8s_namespace }} -o wide"
+          register: diag_pods
+          changed_when: false
 
-    - name: Diagnostiquer le déploiement si le rollout échoue
-      ansible.builtin.shell: |
-        echo "=== deployment/task-app ==="
-        kubectl describe deployment task-app -n {{ k8s_namespace }} || true
-        echo "=== pods ==="
-        kubectl get pods -n {{ k8s_namespace }} -o wide || true
-        echo "=== events ==="
-        kubectl get events -n {{ k8s_namespace }} --sort-by=.metadata.creationTimestamp | tail -50 || true
-      when: rollout_result.rc != 0
-      changed_when: false
+        - name: "[DIAG] Describe des pods non-Ready"
+          ansible.builtin.shell: >
+            kubectl get pods -n {{ k8s_namespace }} -o jsonpath='{.items[*].metadata.name}'
+            | tr ' ' '\n' | xargs -I{} sh -c
+            'echo ---{}---; kubectl describe pod {} -n {{ k8s_namespace }}'
+          register: diag_describe
+          changed_when: false
+
+        - name: "[DIAG] Derniers logs des pods task-app"
+          ansible.builtin.shell: >
+            kubectl logs -n {{ k8s_namespace }} -l app=task-app
+            --tail=50 --all-containers --prefix
+          register: diag_logs
+          changed_when: false
+          failed_when: false
+
+        - name: "[DIAG] Événements récents du namespace"
+          ansible.builtin.command: >
+            kubectl get events -n {{ k8s_namespace }}
+            --sort-by=.lastTimestamp
+          register: diag_events
+          changed_when: false
+
+        - name: Afficher le diagnostic complet
+          ansible.builtin.debug:
+            msg:
+              - "=== PODS ==="
+              - "{{ diag_pods.stdout_lines }}"
+              - "=== DESCRIBE ==="
+              - "{{ diag_describe.stdout_lines }}"
+              - "=== LOGS ==="
+              - "{{ diag_logs.stdout_lines | default(['(aucun log disponible)']) }}"
+              - "=== EVENTS ==="
+              - "{{ diag_events.stdout_lines }}"
+
+        - name: Échouer explicitement après diagnostic
+          ansible.builtin.fail:
+            msg: "Le rollout de task-app a timeout. Voir le diagnostic ci-dessus pour la cause réelle (pods, describe, logs, events)."
 
     - name: Nettoyer les fichiers temporaires contenant des secrets
       ansible.builtin.file:
@@ -201,13 +230,19 @@
         - /tmp/task-secret.yaml
         - /tmp/task-deployment.yaml
 
-    - name: Récupérer l'URL du LoadBalancer
+    - name: Attendre que l'ALB Controller provisionne l'adresse de l'Ingress (jusqu'à 3 min)
+      # Le provisioning d'un ALB par le controller n'est pas instantané (souvent
+      # 60-120s). On boucle plutôt que d'échouer sur un champ encore vide.
       ansible.builtin.command: >
-        kubectl get service task-service -n {{ k8s_namespace }}
+        kubectl get ingress task-ingress -n {{ k8s_namespace }}
         -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
-      register: lb_hostname
+      register: alb_hostname
+      until: alb_hostname.stdout != ""
+      retries: 18
+      delay: 10
       changed_when: false
+      failed_when: false
 
-    - name: Afficher l'URL d'accès à l'application
+    - name: Afficher l'URL d'accès à l'application (via ALB/Ingress)
       ansible.builtin.debug:
-        msg: "App accessible sur : http://{{ lb_hostname.stdout | default('en attente du LoadBalancer, réessaie dans 2 min') }}"
+        msg: "App accessible sur : http://{{ alb_hostname.stdout | default('ALB pas encore provisionné, vérifie : kubectl get ingress task-ingress -n ' + k8s_namespace) }}"

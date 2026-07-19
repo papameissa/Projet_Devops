@@ -1,0 +1,205 @@
+---
+# ==============================================================================
+# 07_alb_controller.yml — Installe l'AWS Load Balancer Controller sur EKS,
+# par manifestes YAML bruts (kubectl apply), PAS par Helm — cohérent avec le
+# reste du projet où tout passe par "kubectl apply -f".
+#
+# Ce controller regarde les ressources Kubernetes "Ingress" (classe "alb") et
+# provisionne, met à jour et supprime automatiquement un Application Load
+# Balancer (ALB) AWS correspondant — c'est le remplaçant du NLB brut exposé
+# directement via "Service type: LoadBalancer".
+#
+# Prérequis : 02_eks.yml doit avoir tourné (fournisseur OIDC activé via
+# "eksctl utils associate-iam-oidc-provider").
+#
+# Étapes (installation SANS Helm, cf. doc officielle "Install with manifests") :
+#   1. Créer la policy IAM officielle AWS pour le controller
+#   2. Créer un ServiceAccount Kubernetes lié à un rôle IAM via IRSA (eksctl)
+#   3. Installer cert-manager (requis pour les certificats TLS du webhook —
+#      seule la voie Helm peut s'en passer, en générant des certs auto-signés)
+#   4. Télécharger le manifeste complet du controller, l'adapter (nom du
+#      cluster + suppression du ServiceAccount qu'il contient, pour ne pas
+#      écraser celui créé par eksctl avec son annotation IRSA), puis l'appliquer
+#
+# Versions figées volontairement (contrairement à un chart Helm, un manifeste
+# brut ne se met JAMAIS à jour tout seul — la policy IAM et le manifeste
+# doivent donc rester alignés sur la MÊME version, choisie explicitement ici).
+# Pour upgrader plus tard : changer alb_controller_version ET relancer ce
+# playbook (kubectl apply est idempotent, ça mettra à jour l'existant).
+# ==============================================================================
+- name: Installer l'AWS Load Balancer Controller (Ingress → ALB), sans Helm
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+  vars:
+    alb_controller_version: "v3.4.0"
+    cert_manager_version: "v1.14.5"
+
+  tasks:
+    - name: Mettre à jour le kubeconfig
+      # OBLIGATOIRE ici : en CI, ce playbook s'exécute sur un runner vierge,
+      # AVANT 06_deploy_taskapp.yml (qui faisait cette mise à jour auparavant).
+      # Sans cette tâche, kubectl n'a aucun contexte cluster et échoue immédiatement.
+      ansible.builtin.command: >
+        aws eks update-kubeconfig
+        --name {{ eks_cluster_name }}
+        --region {{ aws_region }}
+      changed_when: true
+
+    - name: Récupérer l'ID du compte AWS
+      ansible.builtin.command: aws sts get-caller-identity --query Account --output text
+      register: aws_account_id
+      changed_when: false
+
+    # ---------- 1. Policy IAM ----------
+    - name: "Télécharger la policy IAM officielle AWS ({{ alb_controller_version }})"
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/{{ alb_controller_version }}/docs/install/iam_policy.json"
+        dest: /tmp/alb-controller-iam-policy.json
+        mode: "0644"
+        force: true
+
+    - name: Créer la policy IAM du controller (idempotent, ignore si déjà créée)
+      ansible.builtin.command: >
+        aws iam create-policy
+        --policy-name AWSLoadBalancerControllerIAMPolicy
+        --policy-document file:///tmp/alb-controller-iam-policy.json
+      register: policy_create
+      failed_when: false
+      changed_when: policy_create.rc == 0
+
+    # ---------- 2. ServiceAccount IRSA ----------
+    - name: Créer le ServiceAccount IRSA "aws-load-balancer-controller" (kube-system)
+      # Nom du rôle aligné sur le pattern "eksctl-{{ eks_cluster_name }}-*" déjà
+      # autorisé dans 00_iam.yml (Sid IamForEksctlRolesOnly) : évite un
+      # AccessDenied qui surviendrait avec un nom de rôle arbitraire.
+      ansible.builtin.command: >
+        eksctl create iamserviceaccount
+        --cluster {{ eks_cluster_name }}
+        --region {{ aws_region }}
+        --namespace kube-system
+        --name aws-load-balancer-controller
+        --role-name eksctl-{{ eks_cluster_name }}-alb-controller-role
+        --attach-policy-arn arn:aws:iam::{{ aws_account_id.stdout }}:policy/AWSLoadBalancerControllerIAMPolicy
+        --approve
+        --override-existing-serviceaccounts
+      changed_when: true
+
+    # ---------- 3. cert-manager (requis en installation manifeste, pas en Helm) ----------
+    - name: Vérifier si cert-manager est déjà installé (idempotent)
+      ansible.builtin.command: kubectl get namespace cert-manager
+      register: certmanager_check
+      failed_when: false
+      changed_when: false
+
+    - name: "Installer cert-manager ({{ cert_manager_version }})"
+      ansible.builtin.command: >
+        kubectl apply --validate=false
+        -f https://github.com/cert-manager/cert-manager/releases/download/{{ cert_manager_version }}/cert-manager.yaml
+      when: certmanager_check.rc != 0
+      changed_when: true
+
+    - name: Attendre que cert-manager soit prêt (jusqu'à 2 min)
+      ansible.builtin.command: >
+        kubectl rollout status deployment/{{ item }}
+        -n cert-manager --timeout=120s
+      loop:
+        - cert-manager
+        - cert-manager-webhook
+        - cert-manager-cainjector
+      changed_when: false
+
+    # ---------- 4. Manifeste du controller ----------
+    - name: "Télécharger le manifeste complet du controller ({{ alb_controller_version }})"
+      ansible.builtin.get_url:
+        url: "https://github.com/kubernetes-sigs/aws-load-balancer-controller/releases/download/{{ alb_controller_version }}/v3_4_0_full.yaml"
+        dest: /tmp/alb-controller-full.yaml
+        mode: "0644"
+        force: true
+
+    - name: Remplacer le nom du cluster dans le manifeste
+      # VÉCU : le manifeste officiel v3_4_0_full.yaml utilise le placeholder
+      # littéral "your-cluster-name" (PAS "<INSERT_CLUSTER_NAME>" comme
+      # supposé initialement). Comme ansible.builtin.replace ne trouvait
+      # jamais ce motif, il ne faisait RIEN silencieusement (aucune erreur),
+      # et le controller tournait avec --cluster-name=your-cluster-name en
+      # dur — provoquant un "couldn't auto-discover subnets: 2 are tagged
+      # for other clusters" indéfiniment, car aucun subnet n'a ce tag.
+      ansible.builtin.replace:
+        path: /tmp/alb-controller-full.yaml
+        regexp: "your-cluster-name"
+        replace: "{{ eks_cluster_name }}"
+
+    - name: Vérifier qu'il ne reste plus aucun placeholder non résolu
+      # Garde-fou : si AWS change encore ce placeholder dans une future
+      # version du manifeste, on le détecte ici plutôt que de découvrir le
+      # bug 8h plus tard à l'étape Ingress.
+      ansible.builtin.command: grep -c "your-cluster-name\|<INSERT_CLUSTER_NAME>" /tmp/alb-controller-full.yaml
+      register: leftover_placeholder
+      failed_when: false
+      changed_when: false
+
+    - name: Échouer si un placeholder de cluster-name traîne encore
+      ansible.builtin.fail:
+        msg: >
+          Le manifeste ALB controller contient encore un placeholder de nom
+          de cluster non résolu. Vérifie le motif exact dans
+          /tmp/alb-controller-full.yaml (grep -n cluster-name) et mets à
+          jour la tâche "Remplacer le nom du cluster dans le manifeste".
+      when: leftover_placeholder.stdout | trim != "0"
+
+    - name: Déposer le script de nettoyage du ServiceAccount embarqué
+      # IMPORTANT : le manifeste officiel définit son PROPRE ServiceAccount
+      # "aws-load-balancer-controller" (sans annotation IRSA). L'appliquer tel
+      # quel écraserait celui créé juste avant par "eksctl create
+      # iamserviceaccount" (qui, lui, porte l'annotation
+      # eks.amazonaws.com/role-arn indispensable à l'authentification IAM).
+      # On supprime donc uniquement ce document du manifeste multi-YAML par
+      # contenu, plutôt que par numéro de ligne (fragile d'une version à l'autre).
+      ansible.builtin.copy:
+        dest: /tmp/strip_sa.py
+        mode: "0644"
+        content: |
+          import re
+          with open('/tmp/alb-controller-full.yaml') as f:
+              docs = f.read().split('\n---\n')
+          kept = [d for d in docs if not (
+              re.search(r'^kind:\s*ServiceAccount\s*$', d, re.M)
+              and 'name: aws-load-balancer-controller' in d
+          )]
+          with open('/tmp/alb-controller-full.yaml', 'w') as f:
+              f.write('\n---\n'.join(kept))
+          print(f"Documents conserves : {len(kept)} / {len(docs)}")
+
+    - name: Exécuter le nettoyage du ServiceAccount embarqué
+      ansible.builtin.command: python3 /tmp/strip_sa.py
+      register: strip_result
+      changed_when: true
+
+    - name: Afficher le résultat du nettoyage
+      ansible.builtin.debug:
+        var: strip_result.stdout
+
+    - name: Appliquer le manifeste du controller
+      ansible.builtin.command: kubectl apply -f /tmp/alb-controller-full.yaml
+      changed_when: true
+
+    - name: Attendre que le controller soit prêt
+      ansible.builtin.command: >
+        kubectl rollout status deployment/aws-load-balancer-controller
+        -n kube-system --timeout=180s
+      changed_when: false
+
+    - name: Nettoyer les fichiers temporaires
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/alb-controller-iam-policy.json
+        - /tmp/alb-controller-full.yaml
+        - /tmp/strip_sa.py
+
+    - name: Confirmer l'installation
+      ansible.builtin.debug:
+        msg: "AWS Load Balancer Controller {{ alb_controller_version }} installé (sans Helm) — les ressources Ingress (classe alb) provisionneront désormais un ALB automatiquement."

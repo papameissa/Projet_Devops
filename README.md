@@ -19,7 +19,7 @@ avec interface web et API JSON.
 - **Orchestration :** Kubernetes sur AWS EKS (`devops-cluster`, 2× t3.micro)
 - **IaC :** Ansible
 - **CI/CD :** GitHub Actions (runners GitHub-hosted, ubuntu-latest)
-- **Exposition :** AWS Network Load Balancer (Service `type: LoadBalancer`, annotation `aws-load-balancer-type: nlb`)
+- **Exposition :** AWS Application Load Balancer via Ingress (`k8s/ingress.yaml`), provisionné par l'AWS Load Balancer Controller (`07_alb_controller.yml`) ; `task-service` est en `ClusterIP`, seul l'Ingress est public
 - **Autoscaling :** HPA (1-3 replicas) — nécessite `metrics-server` (installé automatiquement par le playbook 06)
 
 ## Structure du projet
@@ -43,9 +43,10 @@ avec interface web et API JSON.
 │       ├── 01_vpc.yml                ← VPC devops-vpc (idempotent, sans NAT Gateway)
 │       ├── 02_eks.yml                ← Cluster EKS DANS devops-vpc (recréable à la demande, ~15-20 min)
 │       ├── 03_ecr.yml                ← [LEGACY] ancien repo "flask-app", inutilisé
+│       ├── 07_alb_controller.yml     ← Installe l'AWS Load Balancer Controller (Ingress → ALB)
 │       ├── 04_ecr_taskapp.yml        ← Crée le repo ECR "task-app"
 │       ├── deploy_complet.yml        ← Orchestrateur : 01→02→04→05→06 en une commande
-│       ├── 07_destroy.yml            ← Détruit le cluster (+ VPC/ECR en option via tags)
+│       ├── 08_destroy.yml            ← Détruit le cluster (+ VPC/ECR en option via tags)
 │       ├── 05_build_push_taskapp.yml ← Build + push l'image vers ECR
 │       └── 06_deploy_taskapp.yml     ← Déploie sur EKS (kubectl apply)
 ├── k8s/                              ← Manifests Kubernetes
@@ -55,7 +56,7 @@ avec interface web et API JSON.
 │   ├── postgres-deployment.yaml      ← StatefulSet Postgres
 │   ├── postgres-service.yaml
 │   ├── deployment.yaml               ← Deployment task-app
-│   ├── service.yaml                  ← LoadBalancer (NLB)
+│   ├── service.yaml                  ← ClusterIP (interne, exposé via Ingress)
 │   └── hpa.yaml                      ← Autoscaling (1-3 replicas, t3.micro)
 └── .github/workflows/ci-cd.yaml      ← Pipeline CI/CD
 ```
@@ -86,8 +87,21 @@ docker-compose up --build
 appliquée — vérifie `kubectl describe networkpolicy -n application` après
 déploiement pour confirmer.
 
+**Point d'attention technique (capacité de pods)** : sur `t3.micro`, le kubelet
+calcule `--max-pods` au boot à partir d'une table statique par instance type
+(~4 pods/nœud, DaemonSets compris) — insuffisant dès que cert-manager, l'ALB
+controller et metrics-server tournent en même temps (`0/2 nodes are available:
+2 Too many pods`, CPU/RAM pourtant largement disponibles). Activer
+`ENABLE_PREFIX_DELEGATION` sur le VPC CNI ne suffit PAS : le kubelet ne
+recalcule jamais `--max-pods` tout seul, même sur des nœuds relancés après coup
+(vécu sur ce cluster). `02_eks.yml` crée donc le nodegroup via un fichier
+`ClusterConfig` (`eksctl create nodegroup -f ...`) avec `maxPodsPerNode: 40`
+explicite — seule méthode documentée pour un nodegroup managé, sans changer
+d'instance type (Free Tier conservé) — combiné à `ENABLE_PREFIX_DELEGATION`
+pour que le CNI ait bien assez d'IPs disponibles derrière cette limite relevée.
+
 **Non couvert (périmètre volontairement limité pour un projet de licence)** :
-HTTPS/TLS sur le NLB (trafic en clair), monitoring/observabilité (Prometheus,
+HTTPS/TLS sur l'ALB (trafic en clair, voir note de sécurité dans `k8s/ingress.yaml`), monitoring/observabilité (Prometheus,
 CloudWatch Container Insights), sauvegarde automatisée du volume PostgreSQL —
 à mentionner en perspectives d'amélioration dans le mémoire.
 
@@ -114,19 +128,19 @@ ansible-playbook playbooks/deploy_complet.yml \
   -e "@vault/secrets.yml" --ask-vault-pass
 ```
 
-Équivalent à lancer `01_vpc.yml → 02_eks.yml → 04_ecr_taskapp.yml →
+Équivalent à lancer `01_vpc.yml → 02_eks.yml → 07_alb_controller.yml → 04_ecr_taskapp.yml →
 05_build_push_taskapp.yml → 06_deploy_taskapp.yml` dans l'ordre, jusqu'à
-l'exposition de l'application via le NLB. Compter ~20-25 minutes (le cluster
+l'exposition de l'application via l'ALB (Ingress). Compter ~20-25 minutes (le cluster
 EKS domine la durée). Chaque playbook reste utilisable séparément pour du
 débogage ciblé.
 
 ## Détruire l'infrastructure (symétrique au provisioning)
 
 ```bash
-ansible-playbook playbooks/07_destroy.yml                # cluster EKS uniquement (le coût principal)
-ansible-playbook playbooks/07_destroy.yml --tags vpc      # + VPC complet
-ansible-playbook playbooks/07_destroy.yml --tags ecr      # + repo ECR (supprime aussi les images)
-ansible-playbook playbooks/07_destroy.yml --tags vpc,ecr  # tout détruire
+ansible-playbook playbooks/08_destroy.yml                # cluster EKS uniquement (le coût principal)
+ansible-playbook playbooks/08_destroy.yml --tags vpc      # + VPC complet
+ansible-playbook playbooks/08_destroy.yml --tags ecr      # + repo ECR (supprime aussi les images)
+ansible-playbook playbooks/08_destroy.yml --tags vpc,ecr  # tout détruire
 ```
 
 Par défaut, seul le cluster est détruit (VPC et ECR sont conservés pour

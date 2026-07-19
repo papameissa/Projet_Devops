@@ -1,10 +1,10 @@
 ---
 # ==============================================================================
 # deploy_complet.yml — Orchestrateur : enchaîne TOUT le provisioning et le
-# déploiement en une seule commande, jusqu'à l'exposition via le NLB.
+# déploiement en une seule commande, jusqu'à l'exposition via l'ALB (Ingress).
 #
 # Équivalent à lancer, dans l'ordre :
-#   01_vpc.yml → 02_eks.yml → 04_ecr_taskapp.yml
+#   01_vpc.yml → 02_eks.yml → 07_alb_controller.yml → 04_ecr_taskapp.yml
 #   → 05_build_push_taskapp.yml → 06_deploy_taskapp.yml
 #
 # Chaque playbook reste idempotent et utilisable séparément (utile pour du
@@ -20,6 +20,7 @@
 # ==============================================================================
 - import_playbook: 01_vpc.yml
 - import_playbook: 02_eks.yml
+- import_playbook: 07_alb_controller.yml
 - import_playbook: 04_ecr_taskapp.yml
 - import_playbook: 05_build_push_taskapp.yml
 - import_playbook: 06_deploy_taskapp.yml

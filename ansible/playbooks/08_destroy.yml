@@ -1,0 +1,180 @@
+---
+# ==============================================================================
+# 08_destroy.yml — Détruit l'infrastructure, symétriquement à 01/02/04.
+#
+# Supprime d'abord l'Ingress (pour laisser l'ALB Controller nettoyer l'ALB
+# proprement) avant de détruire le cluster EKS — voir tâches ci-dessous.
+#
+# Par défaut : ne détruit QUE le cluster EKS (le vrai poste de coût, 0,10$/h).
+# devops-vpc et le repo ECR sont volontairement conservés (pas de NAT Gateway
+# facturé sur le VPC seul, et on garde les images ECR déjà poussées).
+#
+# Usage :
+#   ansible-playbook playbooks/08_destroy.yml                  # cluster uniquement
+#   ansible-playbook playbooks/08_destroy.yml --tags vpc        # + VPC complet
+#   ansible-playbook playbooks/08_destroy.yml --tags ecr        # + repo ECR
+#   ansible-playbook playbooks/08_destroy.yml --tags vpc,ecr    # tout détruire
+# ==============================================================================
+- name: Détruire l'infrastructure task-app (cluster, VPC, ECR selon les tags)
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    # ---------- Cluster EKS (toujours, c'est le poste de coût principal) ----------
+    - name: Vérifier si le cluster EKS existe
+      ansible.builtin.command: eksctl get cluster --name {{ eks_cluster_name }} --region {{ aws_region }}
+      register: cluster_check
+      failed_when: false
+      changed_when: false
+      tags: [cluster, always]
+
+    - name: Mettre à jour le kubeconfig (nécessaire pour supprimer l'Ingress avant le cluster)
+      ansible.builtin.command: >
+        aws eks update-kubeconfig --name {{ eks_cluster_name }} --region {{ aws_region }}
+      when: cluster_check.rc == 0
+      changed_when: true
+      tags: [cluster, always]
+
+    # IMPORTANT : supprimer l'Ingress AVANT eksctl delete cluster. C'est le
+    # controller (pas eksctl/CloudFormation) qui a créé l'ALB ; s'il n'a pas
+    # l'occasion de le voir supprimé, l'ALB (+ ses target groups, security
+    # groups) reste orphelin dans AWS après la suppression du cluster —
+    # facturé indéfiniment et bloquant pour une future suppression du VPC.
+    - name: Supprimer l'Ingress task-ingress (déclenche la suppression propre de l'ALB par le controller)
+      ansible.builtin.command: >
+        kubectl delete ingress task-ingress -n {{ k8s_namespace }} --ignore-not-found=true
+      when: cluster_check.rc == 0
+      failed_when: false
+      changed_when: true
+      tags: [cluster, always]
+
+    - name: Attendre la disparition effective de l'ALB (jusqu'à 3 min)
+      # Recherche par TAG plutôt que par nom : le nom réel de l'ALB généré par
+      # le controller est un hash tronqué (ex. "k8s-applic-taskingr-xxxxx"),
+      # qui ne contient pas forcément la chaîne "application" en clair — un
+      # filtre par nom serait peu fiable. Le tag "ingress.k8s.aws/stack" posé
+      # automatiquement par le controller, lui, est déterministe.
+      ansible.builtin.command: >
+        aws resourcegroupstaggingapi get-resources
+        --region {{ aws_region }}
+        --resource-type-filters elasticloadbalancing:loadbalancer
+        --tag-filters "Key=ingress.k8s.aws/stack,Values={{ k8s_namespace }}/task-ingress"
+        --query "ResourceTagMappingList[].ResourceARN" --output text
+      register: alb_check
+      until: alb_check.stdout == ""
+      retries: 18
+      delay: 10
+      failed_when: false
+      changed_when: false
+      when: cluster_check.rc == 0
+      tags: [cluster, always]
+
+    - name: Avertir si l'ALB est toujours présent après l'attente
+      ansible.builtin.debug:
+        msg: >
+          ATTENTION : l'ALB ({{ alb_check.stdout }}) semble encore présent
+          après 3 min d'attente. La suppression du cluster va se poursuivre,
+          mais vérifie manuellement dans la console AWS (EC2 → Load Balancers)
+          qu'aucune ressource orpheline (ALB, target group, security group)
+          ne reste facturée après coup.
+      when: cluster_check.rc == 0 and alb_check.stdout is defined and alb_check.stdout != ""
+      tags: [cluster, always]
+
+    - name: Supprimer le cluster EKS (~10-15 min)
+      ansible.builtin.command: >
+        eksctl delete cluster --name {{ eks_cluster_name }} --region {{ aws_region }}
+      when: cluster_check.rc == 0
+      register: cluster_delete
+      tags: [cluster, always]
+
+    - name: Confirmer la suppression du cluster
+      ansible.builtin.debug:
+        msg: "Cluster {{ eks_cluster_name }} supprimé (ou déjà absent)."
+      tags: [cluster, always]
+
+    # ---------- Repository ECR (optionnel, tag "ecr") ----------
+    - name: Supprimer le repository ECR (et toutes ses images)
+      ansible.builtin.command: >
+        aws ecr delete-repository
+        --repository-name {{ ecr_repository_name }}
+        --region {{ aws_region }}
+        --force
+      failed_when: false
+      when: "'ecr' in ansible_run_tags"
+      tags: [ecr, never]
+
+    # ---------- VPC complet (optionnel, tag "vpc") ----------
+    # Ordre obligatoire : détacher/supprimer IGW, supprimer route table,
+    # supprimer subnets, PUIS supprimer le VPC.
+    - name: Récupérer l'ID du VPC devops-vpc
+      ansible.builtin.command: >
+        aws ec2 describe-vpcs --region {{ aws_region }}
+        --filters "Name=tag:Name,Values=devops-vpc"
+        --query "Vpcs[0].VpcId" --output text
+      register: vpc_id_result
+      changed_when: false
+      when: "'vpc' in ansible_run_tags"
+      tags: [vpc, never]
+
+    - name: Récupérer l'ID de l'Internet Gateway attachée
+      ansible.builtin.command: >
+        aws ec2 describe-internet-gateways --region {{ aws_region }}
+        --filters "Name=attachment.vpc-id,Values={{ vpc_id_result.stdout }}"
+        --query "InternetGateways[0].InternetGatewayId" --output text
+      register: igw_id_result
+      changed_when: false
+      when: "'vpc' in ansible_run_tags and vpc_id_result.stdout != 'None'"
+      tags: [vpc, never]
+
+    - name: Détacher l'Internet Gateway du VPC
+      ansible.builtin.command: >
+        aws ec2 detach-internet-gateway --region {{ aws_region }}
+        --internet-gateway-id {{ igw_id_result.stdout }}
+        --vpc-id {{ vpc_id_result.stdout }}
+      failed_when: false
+      when: "'vpc' in ansible_run_tags and igw_id_result.stdout is defined and igw_id_result.stdout != 'None'"
+      tags: [vpc, never]
+
+    - name: Supprimer l'Internet Gateway
+      ansible.builtin.command: >
+        aws ec2 delete-internet-gateway --region {{ aws_region }}
+        --internet-gateway-id {{ igw_id_result.stdout }}
+      failed_when: false
+      when: "'vpc' in ansible_run_tags and igw_id_result.stdout is defined and igw_id_result.stdout != 'None'"
+      tags: [vpc, never]
+
+    - name: Récupérer les IDs des subnets du VPC
+      ansible.builtin.command: >
+        aws ec2 describe-subnets --region {{ aws_region }}
+        --filters "Name=vpc-id,Values={{ vpc_id_result.stdout }}"
+        --query "Subnets[].SubnetId" --output text
+      register: subnets_result
+      changed_when: false
+      when: "'vpc' in ansible_run_tags and vpc_id_result.stdout != 'None'"
+      tags: [vpc, never]
+
+    - name: Supprimer chaque subnet
+      ansible.builtin.command: >
+        aws ec2 delete-subnet --region {{ aws_region }} --subnet-id {{ item }}
+      loop: "{{ subnets_result.stdout.split() }}"
+      failed_when: false
+      when: "'vpc' in ansible_run_tags and subnets_result.stdout is defined and subnets_result.stdout != ''"
+      tags: [vpc, never]
+
+    - name: Supprimer le VPC devops-vpc
+      ansible.builtin.command: >
+        aws ec2 delete-vpc --region {{ aws_region }} --vpc-id {{ vpc_id_result.stdout }}
+      failed_when: false
+      when: "'vpc' in ansible_run_tags and vpc_id_result.stdout != 'None'"
+      tags: [vpc, never]
+
+    - name: Avertissement si la suppression du VPC échoue
+      ansible.builtin.debug:
+        msg: >
+          Si la suppression du VPC échoue, une ressource dépendante subsiste
+          (route table associée, security group personnalisé...). Vérifie
+          dans la console AWS → VPC → devops-vpc avant de réessayer.
+      when: "'vpc' in ansible_run_tags"
+      tags: [vpc, never]
