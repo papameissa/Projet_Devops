@@ -75,25 +75,29 @@ jobs:
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
-
       - name: Configurer les credentials AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-
       - name: Installer kubectl
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
-
+      - name: Installer eksctl
+        run: |
+          ARCH=amd64
+          PLATFORM=$(uname -s)_$ARCH
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_${PLATFORM}.tar.gz"
+          tar -xzf "eksctl_${PLATFORM}.tar.gz" -C /tmp && rm "eksctl_${PLATFORM}.tar.gz"
+          sudo mv /tmp/eksctl /usr/local/bin
+          eksctl version
       - name: Installer Ansible et les collections requises
         run: |
           pip install --break-system-packages ansible boto3 botocore
           ansible-galaxy collection install amazon.aws community.aws
-
       - name: Ansible — Déploiement sur EKS
         working-directory: ansible
         run: |
@@ -101,8 +105,8 @@ jobs:
             -e "image_tag=${{ env.IMAGE_TAG }}" \
             -e "postgres_user=${{ secrets.POSTGRES_USER }}" \
             -e "postgres_password=${{ secrets.POSTGRES_PASSWORD }}"
-
-      - name: Afficher l'URL du LoadBalancer
+      - name: Afficher l'URL de l'application (via ALB/Ingress)
         run: |
-          kubectl get service task-service -n application \
+          kubectl get ingress task-ingress -n application \
             -o jsonpath="{.status.loadBalancer.ingress[0].hostname}" || true
+            
