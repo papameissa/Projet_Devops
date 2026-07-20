@@ -1,0 +1,104 @@
+---
+# ==============================================================================
+# 09_bootstrap_ebs_csi.yml — Installation UNIQUE et MANUELLE du driver EBS CSI.
+#
+# POURQUOI CE PLAYBOOK EST SÉPARÉ DU PIPELINE CI/CD (06_deploy_taskapp.yml) :
+# "eksctl create iamserviceaccount" a besoin de lire/gérer le fournisseur OIDC
+# du cluster (iam:GetOpenIDConnectProvider, CreateOpenIDConnectProvider...).
+# Ce sont des permissions IAM sensibles (surface d'escalade de privilèges),
+# qu'on ne veut PAS accorder à l'utilisateur automatisé "task-app-cicd" qui
+# tourne à chaque push GitHub — si cette clé est un jour compromise, on ne
+# veut pas qu'un attaquant puisse toucher à des rôles/fournisseurs IAM.
+#
+# C'est une opération d'INFRASTRUCTURE PONCTUELLE (une fois par cluster),
+# pas une opération de DÉPLOIEMENT APPLICATIF récurrente : elle doit donc
+# être lancée à la main, avec tes propres identifiants AWS (plus larges),
+# exactement comme 00_iam.yml.
+#
+# À exécuter une seule fois après la création du cluster (02_eks.yml), ou
+# après une recréation complète du cluster. 06_deploy_taskapp.yml se contente
+# ensuite de VÉRIFIER que ce bootstrap a bien été fait, sans jamais essayer
+# de le refaire lui-même.
+# ==============================================================================
+- name: "Bootstrap manuel : driver EBS CSI (IRSA + addon + StorageClass)"
+  hosts: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Récupérer l'ID du compte AWS
+      ansible.builtin.command: aws sts get-caller-identity --query Account --output text
+      register: aws_account_id
+      changed_when: false
+
+    - name: Créer le ServiceAccount IRSA "ebs-csi-controller-sa" (kube-system)
+      ansible.builtin.command: >
+        eksctl create iamserviceaccount
+        --cluster {{ eks_cluster_name }}
+        --region {{ aws_region }}
+        --namespace kube-system
+        --name ebs-csi-controller-sa
+        --role-name eksctl-{{ eks_cluster_name }}-ebs-csi-role
+        --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+        --approve
+        --override-existing-serviceaccounts
+      changed_when: true
+
+    - name: Installer/mettre à jour l'addon EKS aws-ebs-csi-driver
+      # replicaCount=1 : cf. note complète dans 06_deploy_taskapp.yml historique —
+      # sur t3.small avec le reste de la stack, 2 réplicas (défaut) débordent
+      # la mémoire disponible ; 1 seul suffit pour ce projet (pas de besoin de HA).
+      ansible.builtin.command: >
+        aws eks update-addon
+        --cluster-name {{ eks_cluster_name }}
+        --addon-name aws-ebs-csi-driver
+        --service-account-role-arn arn:aws:iam::{{ aws_account_id.stdout }}:role/eksctl-{{ eks_cluster_name }}-ebs-csi-role
+        --configuration-values '{"controller":{"replicaCount":1}}'
+        --resolve-conflicts OVERWRITE
+        --region {{ aws_region }}
+      register: ebs_addon_update
+      failed_when: false
+      changed_when: ebs_addon_update.rc == 0
+
+    - name: "Fallback : créer l'addon aws-ebs-csi-driver si l'update a échoué (première installation)"
+      ansible.builtin.command: >
+        aws eks create-addon
+        --cluster-name {{ eks_cluster_name }}
+        --addon-name aws-ebs-csi-driver
+        --service-account-role-arn arn:aws:iam::{{ aws_account_id.stdout }}:role/eksctl-{{ eks_cluster_name }}-ebs-csi-role
+        --configuration-values '{"controller":{"replicaCount":1}}'
+        --resolve-conflicts OVERWRITE
+        --region {{ aws_region }}
+      when: ebs_addon_update.rc != 0
+      changed_when: true
+
+    - name: Attendre que l'addon aws-ebs-csi-driver soit ACTIVE
+      ansible.builtin.command: >
+        aws eks describe-addon
+        --cluster-name {{ eks_cluster_name }}
+        --addon-name aws-ebs-csi-driver
+        --region {{ aws_region }}
+        --query addon.status --output text
+      register: ebs_addon_status
+      until: ebs_addon_status.stdout == "ACTIVE"
+      retries: 18
+      delay: 10
+      changed_when: false
+
+    - name: Mettre à jour le kubeconfig (pour appliquer la StorageClass)
+      ansible.builtin.command: >
+        aws eks update-kubeconfig --name {{ eks_cluster_name }} --region {{ aws_region }}
+      changed_when: true
+
+    - name: Appliquer la StorageClass gp3 par défaut
+      ansible.builtin.command: >
+        kubectl apply -f {{ playbook_dir }}/../../k8s/storageclass.yaml
+      changed_when: true
+
+    - name: Confirmer le bootstrap terminé
+      ansible.builtin.debug:
+        msg: >
+          Driver EBS CSI installé et StorageClass gp3 appliquée. Le pipeline
+          CI/CD (06_deploy_taskapp.yml) peut maintenant tourner normalement,
+          il se contentera de vérifier que tout est en place.

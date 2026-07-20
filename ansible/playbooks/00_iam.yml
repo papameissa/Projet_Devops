@@ -116,18 +116,6 @@
                 "Resource": "*"
               },
               {
-                "Sid": "OidcProviderForIrsa",
-                "Effect": "Allow",
-                "Action": [
-                  "iam:CreateOpenIDConnectProvider",
-                  "iam:DeleteOpenIDConnectProvider",
-                  "iam:GetOpenIDConnectProvider",
-                  "iam:TagOpenIDConnectProvider",
-                  "iam:ListOpenIDConnectProviders"
-                ],
-                "Resource": "*"
-              },
-              {
                 "Sid": "IamPolicyForAlbController",
                 "Effect": "Allow",
                 "Action": [
@@ -139,7 +127,7 @@
             ]
           }
 
-    - name: "Créer la policy IAM (idempotent, ignore si déjà créée)"
+    - name: "Créer la policy IAM (première fois)"
       ansible.builtin.command: >
         aws iam create-policy
         --policy-name "{{ iam_policy_name }}"
@@ -152,6 +140,43 @@
       ansible.builtin.command: aws sts get-caller-identity --query Account --output text
       register: aws_account_id
       changed_when: false
+
+    # ---------- Mise à jour de la policy si elle existait déjà ----------
+    # BUG VÉCU : "aws iam create-policy" échoue silencieusement
+    # (failed_when: false) dès que la policy existe, et RIEN ne poussait
+    # jamais le nouveau contenu du JSON ci-dessus vers AWS ensuite. Résultat :
+    # la policy réellement attachée à task-app-cicd restait bloquée sur sa
+    # toute première version, indéfiniment — même après avoir ajouté de
+    # nouveaux Sid (ex: OidcProviderForIrsa) dans ce fichier. Le pipeline
+    # CI/CD utilisait donc des droits obsolètes sans que rien ne le signale.
+    - name: "Lister les versions existantes de la policy (pour respecter la limite de 5 d'AWS)"
+      ansible.builtin.command: >
+        aws iam list-policy-versions
+        --policy-arn arn:aws:iam::{{ aws_account_id.stdout }}:policy/{{ iam_policy_name }}
+        --query "Versions[?IsDefaultVersion==`false`].VersionId"
+        --output text
+      register: old_policy_versions
+      when: policy_create.rc != 0
+      changed_when: false
+
+    - name: "Supprimer la plus ancienne version non-défaut si on est à la limite (5 versions max)"
+      ansible.builtin.command: >
+        aws iam delete-policy-version
+        --policy-arn arn:aws:iam::{{ aws_account_id.stdout }}:policy/{{ iam_policy_name }}
+        --version-id {{ (old_policy_versions.stdout.split() | first) }}
+      when: >
+        policy_create.rc != 0 and old_policy_versions.stdout is defined
+        and (old_policy_versions.stdout.split() | length) >= 4
+      changed_when: true
+
+    - name: "Mettre à jour la policy avec le document actuel (nouvelle version par défaut)"
+      ansible.builtin.command: >
+        aws iam create-policy-version
+        --policy-arn arn:aws:iam::{{ aws_account_id.stdout }}:policy/{{ iam_policy_name }}
+        --policy-document file:///tmp/task-app-cicd-policy.json
+        --set-as-default
+      when: policy_create.rc != 0
+      changed_when: true
 
     - name: "Créer l'utilisateur IAM CI/CD (idempotent, ignore si déjà créé)"
       ansible.builtin.command: >
